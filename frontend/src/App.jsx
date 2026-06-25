@@ -3,6 +3,7 @@ import { useState, useEffect } from 'react'
 import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom'
 import Bookmap from './components/Bookmap'
 import Dashboard from './components/Dashboard'
+import ScalperPanel from './components/ScalperPanel'
 import './App.css'
 
 // API base URL - replace with your actual backend URL
@@ -45,6 +46,10 @@ function App() {
               <h1 className="text-3xl font-bold text-blue-400 select-none">
                 Market Depth
               </h1>
+              <div className="flex gap-4 text-sm">
+                <Link to="/" className="text-text-secondary hover:text-blue-400">Bookmap</Link>
+                <Link to="/scalper" className="text-text-secondary hover:text-blue-400">Scalper</Link>
+              </div>
             </div>
           </nav>
         </header>        
@@ -83,6 +88,7 @@ function App() {
             />
 
             <Route path="/bookmap/:symbol" element={<Bookmap apiBaseUrl={API_BASE_URL} />} />
+            <Route path="/scalper" element={<ScalperPanel apiBaseUrl={API_BASE_URL} />} />
           </Routes>
         </main>          
         <footer className="mt-auto bg-transparent">

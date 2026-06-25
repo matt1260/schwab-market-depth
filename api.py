@@ -84,6 +84,79 @@ def get_db_connection():
         print(traceback.format_exc())
         raise
 
+# ── Standalone scalper sandbox (Schwab L2 data + Alpaca paper exec + Opus AI) ──
+import os as _os
+_scalper = {"engine": None, "feed": None}
+SCALPER_SYMBOLS = ["SPY", "QQQ"]
+
+
+@app.on_event("startup")
+async def _start_scalper():
+    """Build the equity feed + scalper engine and start them in the API event loop.
+    The engine starts DISABLED (no orders) — toggle on from the UI when ready."""
+    try:
+        from scalper.schwab_feed import SchwabEquityFeed
+        from scalper.alpaca_exec import AlpacaExec
+        from scalper.engine import ScalperEngine
+        feed = SchwabEquityFeed(SCALPER_SYMBOLS)
+        alpaca = AlpacaExec(_os.getenv("ALPACA_API_KEY"), _os.getenv("ALPACA_API_SECRET"),
+                            paper=str(_os.getenv("ALPACA_PAPER", "true")).lower() != "false")
+        engine = ScalperEngine(SCALPER_SYMBOLS, stream_getter=lambda: feed, alpaca=alpaca,
+                               anthropic_key=_os.getenv("ANTHROPIC_API_KEY"))
+        _scalper["feed"], _scalper["engine"] = feed, engine
+        await feed.start()   # opens Schwab L1+L2 stream (re-auth in browser on first run)
+        await engine.start() # loop runs; enabled=False until toggled
+        print("Scalper engine + Schwab equity feed started (engine disabled)")
+    except Exception as e:
+        import traceback
+        print(f"Scalper startup failed (UI still runs): {e}")
+        traceback.print_exc()
+
+
+@app.get("/scalper/status")
+async def scalper_status():
+    eng = _scalper["engine"]
+    if eng is None:
+        return {"available": False}
+    st = eng.status()
+    st["available"] = True
+    st["feed_running"] = bool(_scalper["feed"] and _scalper["feed"].running)
+    return st
+
+
+@app.post("/scalper/toggle")
+async def scalper_toggle(body: dict):
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    eng.set_enabled(bool(body.get("enabled")))
+    return {"enabled": eng.enabled}
+
+
+@app.post("/scalper/config")
+async def scalper_config(body: dict):
+    """Set signal_mode and/or any tunable knob from the UI."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    if "signal_mode" in body and body["signal_mode"] in ("momentum", "fade", "auto", "ai"):
+        eng.signal_mode = body["signal_mode"]
+    applied = eng._apply_runtime_params({k: v for k, v in body.items() if k != "signal_mode"})
+    return {"signal_mode": eng.signal_mode, "applied": applied}
+
+
+@app.get("/scalper/trades")
+async def scalper_trades(limit: int = 100):
+    try:
+        sc = sqlite3.connect(_os.path.join(DATA_DIR, "scalper.db"))
+        sc.row_factory = sqlite3.Row
+        rows = sc.execute("SELECT * FROM scalp_trades ORDER BY ts DESC LIMIT ?", (limit,)).fetchall()
+        sc.close()
+        return {"trades": [dict(r) for r in rows]}
+    except Exception:
+        return {"trades": []}
+
+
 @app.get("/")
 async def root():
     return {"message": "Market Depth API is running"}
@@ -296,17 +369,24 @@ async def get_historical_full(symbol: str, limit: Optional[int] = None):
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # Start the stream process
-    stream_process = multiprocessing.Process(target=stream_main)
-    stream_process.start()
-    print("Stream process started")
-    
+
+    # Schwab allows only ONE stream per login. The scalper sandbox opens its own
+    # equity L1+L2 stream in-process (startup event), so the options-depth stream
+    # subprocess must NOT also run by default or they'll conflict. Set
+    # RUN_OPTIONS_STREAM=1 to run the original options bookmap stream instead.
+    stream_process = None
+    if str(_os.getenv("RUN_OPTIONS_STREAM", "")).lower() in ("1", "true", "yes"):
+        stream_process = multiprocessing.Process(target=stream_main)
+        stream_process.start()
+        print("Options-depth stream process started")
+    else:
+        print("Options-depth stream disabled (scalper equity feed runs in-process). "
+              "Set RUN_OPTIONS_STREAM=1 to enable the options bookmap stream.")
+
     try:
-        # Start the API server
         uvicorn.run(app, host="0.0.0.0", port=8080)
     finally:
-        # Ensure we clean up the stream process
-        stream_process.terminate()
-        stream_process.join()
-        print("Stream process stopped")
+        if stream_process is not None:
+            stream_process.terminate()
+            stream_process.join()
+            print("Stream process stopped")

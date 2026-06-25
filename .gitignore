@@ -56,4 +56,6 @@ htmlcov/
 .cache/
 coverage.xml
 nosetests.xml
-test-results/
+test-results/scalper/__pycache__/
+data/scalper.db
+tokens.json
