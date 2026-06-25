@@ -842,6 +842,14 @@ class ScalperEngine:
             "entries_today": self._entries_today, "exits_today": self._exits_today, "wins_today": self._wins_today,
             "win_rate": round(self._wins_today / self._exits_today, 2) if self._exits_today else None,
             "open_scalps": len(self._open),
+            "open_positions": [
+                {
+                    "occ": sc.occ, "underlying": sc.underlying, "direction": sc.direction,
+                    "qty": sc.qty, "entry_mid": round(sc.entry_mid, 2),
+                    "held_s": round((datetime.utcnow() - sc.opened_at).total_seconds(), 0),
+                    "entry_ctx": sc.entry_ctx,
+                } for sc in self._open.values()
+            ],
             "symbols": self.symbols,
             "ai_supervisor_seconds": self.ai_supervisor_seconds,
             "ai_tune_seconds": self.ai_tune_seconds,
