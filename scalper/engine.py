@@ -117,6 +117,12 @@ class ScalperEngine:
         self._anchor_sum: Dict[str, float] = {}
         self._anchor_sq: Dict[str, float] = {}
         self._anchor_n: Dict[str, int] = {}
+        # Rolling chart series per symbol for the live VWAP-ish chart:
+        # (epoch_s, price, mean, upper_band, lower_band). ~1/sec, ~30min retained.
+        self._chart_hist: Dict[str, Deque[Tuple[int, float, Optional[float], Optional[float], Optional[float]]]] = {
+            s: deque(maxlen=1800) for s in symbols
+        }
+        self._chart_last_t: Dict[str, int] = {}
         self._open: Dict[str, _OpenScalp] = {}
         self._pending_signal: Dict[str, Dict[str, Any]] = {}
         self._stop_cooldown: Dict[str, datetime] = {}
@@ -183,6 +189,28 @@ class ScalperEngine:
             if px and px > 0:
                 self._prices.setdefault(sym, deque(maxlen=ind.PRICE_WINDOW)).append((now, px))
                 self._record_regime_sample(sym, px, now)
+                self._record_chart_point(sym, px)
+
+    def _record_chart_point(self, sym, px):
+        """Append (time, price, mean, ±2σ band) for the live chart, ~1/sec."""
+        import time as _t
+        t = int(_t.time())
+        if self._chart_last_t.get(sym) == t:
+            return  # at most one point per second
+        self._chart_last_t[sym] = t
+        mean = self._anchored_mean(sym)
+        std = ind.anchor_std(self._anchor_sum.get(sym, 0.0), self._anchor_sq.get(sym, 0.0), self._anchor_n.get(sym, 0))
+        upper = (mean + ind.VWAP_BAND_K * std) if (mean is not None and std is not None) else None
+        lower = (mean - ind.VWAP_BAND_K * std) if (mean is not None and std is not None) else None
+        self._chart_hist[sym].append((t, round(px, 2),
+                                      round(mean, 2) if mean is not None else None,
+                                      round(upper, 2) if upper is not None else None,
+                                      round(lower, 2) if lower is not None else None))
+
+    def chart_history(self, sym) -> List[Dict[str, Any]]:
+        """Live chart series for a symbol: [{t, price, mean, upper, lower}]."""
+        return [{"t": t, "price": p, "mean": m, "upper": u, "lower": lo}
+                for (t, p, m, u, lo) in self._chart_hist.get(sym, ())]
 
     def _record_regime_sample(self, sym, px, now):
         self._anchor_sum[sym] = self._anchor_sum.get(sym, 0.0) + px

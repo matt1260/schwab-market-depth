@@ -156,6 +156,15 @@ async def scalper_config(body: dict):
     return {"signal_mode": eng.signal_mode, "applied": applied}
 
 
+@app.get("/scalper/chart/{symbol}")
+async def scalper_chart(symbol: str):
+    """Live price + session-mean (VWAP-ish) + ±2σ band series for the chart."""
+    eng = _scalper["engine"]
+    if eng is None:
+        return {"symbol": symbol, "series": []}
+    return {"symbol": symbol, "series": eng.chart_history(symbol)}
+
+
 @app.get("/scalper/trades")
 async def scalper_trades(limit: int = 100):
     try:
