@@ -49,18 +49,23 @@ export default function VwapChart({ apiBaseUrl, symbol, height = 320 }) {
         series.current.upper.setData(clean.filter((p) => p.upper != null).map((p) => ({ time: p.t, value: p.upper })));
         series.current.lower.setData(clean.filter((p) => p.lower != null).map((p) => ({ time: p.t, value: p.lower })));
 
-        // entry/exit markers from trade history
+        // entry/exit markers from trade history — ONLY within the chart's time
+        // window, else lightweight-charts clamps off-window markers onto the last
+        // bar (the "C/P stuck on current price" artifact).
         try {
+          const tMin = clean.length ? clean[0].t : 0;
+          const tMax = clean.length ? clean[clean.length - 1].t : 0;
+          const inWin = (t) => t && t >= tMin && t <= tMax;
           const mr = await fetch(`${apiBaseUrl}/scalper/markers/${symbol}`);
           const md = await mr.json();
           const marks = [];
           for (const m of (md.markers || [])) {
-            if (m.entry_t) marks.push({
+            if (inWin(m.entry_t)) marks.push({
               time: m.entry_t, position: 'belowBar',
               color: m.direction === 'call' ? '#22c55e' : '#ef4444',
               shape: 'arrowUp', text: (m.direction === 'call' ? 'C' : 'P'),
             });
-            if (m.exit_t) marks.push({
+            if (inWin(m.exit_t)) marks.push({
               time: m.exit_t, position: 'aboveBar',
               color: (m.pnl ?? 0) >= 0 ? '#22c55e' : '#ef4444',
               shape: 'arrowDown', text: `${(m.pnl ?? 0) >= 0 ? '+' : ''}${Math.round(m.pnl ?? 0)} ${m.reason || ''}`,
