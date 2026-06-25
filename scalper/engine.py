@@ -59,6 +59,9 @@ _DSL_SIGNALS = {
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "scalper.db")
 
+# Max age of an L1 quote before we treat the feed as stale and refuse entries.
+_MAX_QUOTE_AGE_S = 15
+
 
 class _OpenScalp:
     def __init__(self, occ, underlying, direction, qty, entry_mid, order_id):
@@ -196,6 +199,15 @@ class ScalperEngine:
             return None
         try:
             return stream.book_imbalance(sym)
+        except Exception:
+            return None
+
+    def _quote_age(self, sym) -> Optional[float]:
+        stream = self._get_stream()
+        if stream is None or not hasattr(stream, "quote_age_seconds"):
+            return None
+        try:
+            return stream.quote_age_seconds(sym)
         except Exception:
             return None
 
@@ -540,6 +552,14 @@ class ScalperEngine:
             cd = self._stop_cooldown.get(sym)
             if cd and now < cd:
                 continue
+            # Staleness guard: never enter on a frozen/stalled feed. If the L1
+            # quote hasn't updated in _MAX_QUOTE_AGE_S, skip — a scalper trading
+            # on stale prices is how you bleed.
+            age = self._quote_age(sym)
+            if age is not None and age > _MAX_QUOTE_AGE_S:
+                self._pending_signal.pop(sym, None)
+                logger.warning("Scalper %s: STALE feed (%.0fs) — skipping entries", sym, age)
+                continue
             momentum_dir, strength = self._momentum_signal(sym)
             if sym in self._regime_history:
                 self._regime_history[sym].append(momentum_dir)
@@ -726,6 +746,7 @@ class ScalperEngine:
                     "vwap_z": self._vwap_z(s),
                     "mtf": self._mtf_trend(s),
                     "book_imbalance": self._book_imbalance(s),
+                    "quote_age_s": round(a, 1) if (a := self._quote_age(s)) is not None else None,
                 } for s in self.symbols
             },
         }

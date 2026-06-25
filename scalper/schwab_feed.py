@@ -71,6 +71,7 @@ class SchwabEquityFeed:
         self._stream = None
         self._running = False
         self._client = None  # schwabdev Client for REST options quotes
+        self._watchdog_task = None
 
     @property
     def running(self) -> bool:
@@ -88,18 +89,62 @@ class SchwabEquityFeed:
         self._stream = StreamAsync(client)
         self._running = True
         await self._stream.start(receiver=self._on_message)
+        await self._subscribe()
+        logger.info("Schwab equity feed started for %s", self.symbols)
+        self._watchdog_task = asyncio.create_task(self._watchdog(), name="schwab-feed-watchdog")
+
+    async def _subscribe(self):
         keys = ",".join(self.symbols)
         await self._stream.send(self._stream.level_one_equities(keys, _L1_FIELDS))
         await self._stream.send(self._stream.nasdaq_book(keys, _BOOK_FIELDS))
-        logger.info("Schwab equity feed started for %s", self.symbols)
+
+    async def _watchdog(self):
+        """Keep the access token fresh and recover a stalled feed. The streamer's
+        internal reconnect can't survive a 7-hour+ access-token expiry, so we
+        refresh tokens periodically and, if quotes go stale, tear down + rebuild
+        the stream (re-auth in browser only if the 7-day refresh token expired)."""
+        STALE_S = 60
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+                if not self._running:
+                    break
+                # keep the access token fresh (refreshes if <~1min to expiry)
+                try:
+                    if self._client:
+                        self._client.update_tokens()
+                except Exception as e:
+                    logger.warning("feed token refresh failed: %s", e)
+                # staleness → rebuild the stream
+                ages = [self.quote_age_seconds(s) for s in self.symbols]
+                fresh = [a for a in ages if a is not None]
+                if fresh and min(fresh) > STALE_S:
+                    logger.warning("Feed stale (min age %.0fs) — rebuilding stream", min(fresh))
+                    try:
+                        await self._stream.stop()
+                    except Exception:
+                        pass
+                    try:
+                        await self._stream.start(receiver=self._on_message)
+                        await self._subscribe()
+                        logger.info("Feed stream rebuilt")
+                    except Exception as e:
+                        logger.warning("Feed rebuild failed: %s", e)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("feed watchdog error: %s", e)
 
     async def stop(self):
-        if self._stream and self._running:
+        self._running = False
+        wd = getattr(self, "_watchdog_task", None)
+        if wd:
+            wd.cancel()
+        if self._stream:
             try:
                 await self._stream.stop()
             except Exception:
                 pass
-        self._running = False
         self._stream = None
 
     async def _on_message(self, raw: Any):
@@ -145,6 +190,15 @@ class SchwabEquityFeed:
     def book_imbalance(self, sym) -> Optional[float]:
         s = self._snap.get(sym)
         return s.get("book_imbalance") if s else None
+
+    def quote_age_seconds(self, sym) -> Optional[float]:
+        """Seconds since the last L1 update for a symbol (None if never). Used by
+        the engine to refuse trading on a stalled/frozen feed."""
+        s = self._snap.get(sym)
+        ts = s.get("ts") if s else None
+        if ts is None:
+            return None
+        return (datetime.now(timezone.utc) - ts).total_seconds()
 
     def option_quote(self, occ: str) -> Dict[str, Any]:
         """Real-time options quote from Schwab (bid/ask/mid/mark + greeks). Blocking
