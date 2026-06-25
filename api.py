@@ -141,7 +141,18 @@ async def scalper_config(body: dict):
         raise HTTPException(503, "Scalper not initialized")
     if "signal_mode" in body and body["signal_mode"] in ("momentum", "fade", "auto", "ai"):
         eng.signal_mode = body["signal_mode"]
-    applied = eng._apply_runtime_params({k: v for k, v in body.items() if k != "signal_mode"})
+    # AI supervision cadence (seconds). Clamp to sane ranges. ai_supervisor_seconds
+    # = fast mode-check; ai_tune_seconds = slow deep tune/strategy cycle.
+    cadence = {}
+    if "ai_supervisor_seconds" in body:
+        eng.ai_supervisor_seconds = max(30, min(1800, int(body["ai_supervisor_seconds"])))
+        cadence["ai_supervisor_seconds"] = eng.ai_supervisor_seconds
+    if "ai_tune_seconds" in body:
+        eng.ai_tune_seconds = max(60, min(3600, int(body["ai_tune_seconds"])))
+        cadence["ai_tune_seconds"] = eng.ai_tune_seconds
+    skip = ("signal_mode", "ai_supervisor_seconds", "ai_tune_seconds")
+    applied = eng._apply_runtime_params({k: v for k, v in body.items() if k not in skip})
+    applied.update(cadence)
     return {"signal_mode": eng.signal_mode, "applied": applied}
 
 

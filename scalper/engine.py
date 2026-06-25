@@ -736,6 +736,8 @@ class ScalperEngine:
             "win_rate": round(self._wins_today / self._exits_today, 2) if self._exits_today else None,
             "open_scalps": len(self._open),
             "symbols": self.symbols,
+            "ai_supervisor_seconds": self.ai_supervisor_seconds,
+            "ai_tune_seconds": self.ai_tune_seconds,
             "options_quote_source": "schwab" if (self._get_stream() and hasattr(self._get_stream(), "option_quote")) else "alpaca",
             "tunables": {k: getattr(self, k) for k in _TUNE_SAFE_BANDS},
             "signals": {

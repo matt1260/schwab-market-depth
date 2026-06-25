@@ -77,11 +77,19 @@ export default function ScalperPanel({ apiBaseUrl }) {
           ))}
         </div>
         {st.signal_mode === 'ai' && (
-          <div className="mt-2 text-xs">
-            AI mode: <span className="text-blue-300 font-mono">{st.ai_mode || '—'}</span>
-            {st.ai_reason && <span className="text-text-secondary"> — {st.ai_reason}</span>}
-            {st.ai_error && <span className="text-red-400"> · error: {st.ai_error}</span>}
-          </div>
+          <>
+            <div className="mt-2 text-xs">
+              AI mode: <span className="text-blue-300 font-mono">{st.ai_mode || '—'}</span>
+              {st.ai_reason && <span className="text-text-secondary"> — {st.ai_reason}</span>}
+              {st.ai_error && <span className="text-red-400"> · error: {st.ai_error}</span>}
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <Cadence label="Mode-check every" valSec={st.ai_supervisor_seconds}
+                       opts={[60, 120, 180, 300]} onPick={(v) => post('/scalper/config', { ai_supervisor_seconds: v })} />
+              <Cadence label="Deep tune every" valSec={st.ai_tune_seconds}
+                       opts={[180, 300, 600, 900, 1800]} onPick={(v) => post('/scalper/config', { ai_tune_seconds: v })} />
+            </div>
+          </>
         )}
       </div>
 
@@ -152,6 +160,22 @@ export default function ScalperPanel({ apiBaseUrl }) {
   );
 }
 
+const fmtSec = (s) => (s == null ? '—' : s >= 60 ? `${Math.round(s / 60)}m${s % 60 ? ` ${s % 60}s` : ''}` : `${s}s`);
+function Cadence({ label, valSec, opts, onPick }) {
+  return (
+    <div>
+      <div className="text-[10px] text-text-secondary uppercase mb-1">{label} <span className="text-blue-300">{fmtSec(valSec)}</span></div>
+      <div className="flex gap-1 flex-wrap">
+        {opts.map((o) => (
+          <button key={o} onClick={() => onPick(o)}
+            className={`px-2 py-0.5 rounded text-[10px] ${valSec === o ? 'bg-blue-500 text-black font-bold' : 'bg-gray-700 text-gray-300'}`}>
+            {fmtSec(o)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 const fmt = (v) => (v == null ? '—' : typeof v === 'number' ? v.toFixed(3) : String(v));
 const Stat = ({ label, val, color }) => (
   <div className="glass p-3 rounded-lg text-center">
