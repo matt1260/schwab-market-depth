@@ -48,6 +48,30 @@ export default function VwapChart({ apiBaseUrl, symbol, height = 320 }) {
         series.current.mean.setData(clean.filter((p) => p.mean != null).map((p) => ({ time: p.t, value: p.mean })));
         series.current.upper.setData(clean.filter((p) => p.upper != null).map((p) => ({ time: p.t, value: p.upper })));
         series.current.lower.setData(clean.filter((p) => p.lower != null).map((p) => ({ time: p.t, value: p.lower })));
+
+        // entry/exit markers from trade history
+        try {
+          const mr = await fetch(`${apiBaseUrl}/scalper/markers/${symbol}`);
+          const md = await mr.json();
+          const marks = [];
+          for (const m of (md.markers || [])) {
+            if (m.entry_t) marks.push({
+              time: m.entry_t, position: 'belowBar',
+              color: m.direction === 'call' ? '#22c55e' : '#ef4444',
+              shape: 'arrowUp', text: (m.direction === 'call' ? 'C' : 'P'),
+            });
+            if (m.exit_t) marks.push({
+              time: m.exit_t, position: 'aboveBar',
+              color: (m.pnl ?? 0) >= 0 ? '#22c55e' : '#ef4444',
+              shape: 'arrowDown', text: `${(m.pnl ?? 0) >= 0 ? '+' : ''}${Math.round(m.pnl ?? 0)} ${m.reason || ''}`,
+            });
+          }
+          // markers must be sorted ascending by time + de-duped
+          marks.sort((a, b) => a.time - b.time);
+          const seenT = new Set(); const uniq = [];
+          for (const mk of marks) { const k = mk.time + mk.position; if (!seenT.has(k)) { seenT.add(k); uniq.push(mk); } }
+          series.current.price.setMarkers(uniq);
+        } catch { /* ignore */ }
       } catch { /* ignore */ }
     };
     pull();

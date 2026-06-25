@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 _OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
 
+
+def _r3(x):
+    return round(x, 3) if isinstance(x, (int, float)) else x
+
 _TUNE_SAFE_BANDS: Dict[str, Tuple[float, float]] = {
     "profit_target_pct": (0.05, 0.60),
     "stop_pct": (0.05, 0.35),
@@ -74,6 +78,7 @@ class _OpenScalp:
         self.order_id = order_id
         self.opened_at = datetime.utcnow()
         self.peak_mid = entry_mid
+        self.entry_ctx: Dict[str, Any] = {}  # signals snapshot captured at entry
 
 
 class ScalperEngine:
@@ -152,6 +157,7 @@ class ScalperEngine:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._init_db()
+        self._load_state()  # restore enabled/mode/tunables across restarts
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self):
@@ -172,6 +178,43 @@ class ScalperEngine:
 
     def set_enabled(self, on: bool):
         self.enabled = on
+        self._save_state()
+
+    # ── state persistence (survive restarts) ───────────────────────────────
+    _STATE_KEYS = ("signal_mode", "enabled", "entry_threshold", "stop_pct",
+                   "profit_target_pct", "time_stop_seconds", "chop_min_efficiency",
+                   "min_recent_range_pct", "chop_guard_enabled", "velocity_gate_enabled",
+                   "profit_lock_arm_usd", "profit_giveback_frac",
+                   "ai_supervisor_seconds", "ai_tune_seconds", "max_concurrent",
+                   "per_trade_usd", "budget_usd", "max_dte")
+
+    def _state_path(self):
+        return os.path.join(os.path.dirname(DB_PATH), "scalper_state.json")
+
+    def save_state(self):
+        self._save_state()
+
+    def _save_state(self):
+        try:
+            data = {k: getattr(self, k) for k in self._STATE_KEYS}
+            with open(self._state_path(), "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.debug("save_state failed: %s", e)
+
+    def _load_state(self):
+        try:
+            p = self._state_path()
+            if not os.path.exists(p):
+                return
+            with open(p) as f:
+                data = json.load(f)
+            for k in self._STATE_KEYS:
+                if k in data and data[k] is not None:
+                    setattr(self, k, data[k])
+            logger.info("Restored scalper state: enabled=%s mode=%s", self.enabled, self.signal_mode)
+        except Exception as e:
+            logger.debug("load_state failed: %s", e)
 
     # ── ingest prices from the Schwab stream ───────────────────────────────
     def _ingest_prices(self):
@@ -550,8 +593,10 @@ class ScalperEngine:
         if reason == "stop":
             self._stop_cooldown[scalp.underlying] = datetime.utcnow() + timedelta(seconds=60)
         self._open.pop(scalp.occ, None)
-        self._persist_trade(scalp, exit_mid, pnl_usd, reason)
-        logger.info("EXIT %s %s pnl=$%.0f (%s)", scalp.direction, scalp.occ, pnl_usd, reason)
+        held_s = (datetime.utcnow() - scalp.opened_at).total_seconds()
+        exit_ctx = self._signal_snapshot(scalp.underlying)
+        self._persist_trade(scalp, exit_mid, pnl_usd, pnl_pct, reason, held_s, exit_ctx)
+        logger.info("EXIT %s %s pnl=$%.0f (%s) held=%.0fs", scalp.direction, scalp.occ, pnl_usd, reason, held_s)
 
     # ── entries (port of _scan_for_entries) ────────────────────────────────
     async def _scan_for_entries(self):
@@ -653,10 +698,33 @@ class ScalperEngine:
             return
         entry = await asyncio.to_thread(self.alpaca.fill_price, order.get("order_id"), ask)
         scalp = _OpenScalp(occ, sym, direction, qty, float(entry), order.get("order_id"))
+        scalp.entry_ctx = self._signal_snapshot(sym, score)  # full forensic context at entry
         self._open[occ] = scalp
         self._entries_today += 1
         self._last_entry_at = datetime.utcnow()
         logger.info("ENTRY %s %s x%d @ %.2f (score=%.2f)", direction, occ, qty, entry, score)
+
+    def _signal_snapshot(self, sym, score=None) -> Dict[str, Any]:
+        """Full signal context for a symbol — captured at entry/exit so each trade
+        is forensically explainable (why it entered, what the tape was doing)."""
+        mt = self._mtf_trend(sym)
+        return {
+            "underlying": self._latest_price(sym),
+            "signal_mode": self.signal_mode,
+            "ai_mode": self._ai_mode,
+            "ai_assessment": self._ai_assessment,
+            "score": round(score, 3) if score is not None else None,
+            "efficiency_ratio": _r3(self._efficiency_ratio(sym)),
+            "recent_range_pct": _r3(self._recent_range_pct(sym)),
+            "vwap_z": _r3(self._vwap_z(sym)),
+            "anchored_mean": _r3(self._anchored_mean(sym)),
+            "mtf_dir": (mt[0] if mt else None),
+            "mtf_alignment": _r3(mt[1]) if mt else None,
+            "book_imbalance": _r3(self._book_imbalance(sym)),
+            "entry_threshold": self.entry_threshold,
+            "stop_pct": self.stop_pct,
+            "profit_target_pct": self.profit_target_pct,
+        }
 
     # ── supervisor ─────────────────────────────────────────────────────────
     async def _maybe_run_supervisor(self):
@@ -728,15 +796,26 @@ class ScalperEngine:
     def _init_db(self):
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         c = sqlite3.connect(DB_PATH)
-        c.execute("CREATE TABLE IF NOT EXISTS scalp_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, occ TEXT, underlying TEXT, direction TEXT, qty INTEGER, entry REAL, exit REAL, pnl REAL, reason TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS scalp_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, occ TEXT, underlying TEXT, direction TEXT, qty INTEGER, entry REAL, exit REAL, pnl REAL, pnl_pct REAL, reason TEXT, held_s REAL, opened_ts INTEGER, entry_ctx TEXT, exit_ctx TEXT)")
+        # Migrate older DBs that predate the rich columns.
+        for col, decl in (("pnl_pct","REAL"),("held_s","REAL"),("opened_ts","INTEGER"),("entry_ctx","TEXT"),("exit_ctx","TEXT")):
+            try:
+                c.execute(f"ALTER TABLE scalp_trades ADD COLUMN {col} {decl}")
+            except Exception:
+                pass
         c.execute("CREATE TABLE IF NOT EXISTS scalp_ai (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, cycle TEXT, mode TEXT, assessment TEXT, reasoning TEXT, param_changes TEXT, strategy_spec TEXT)")
         c.commit(); c.close()
 
-    def _persist_trade(self, scalp, exit_mid, pnl, reason):
+    def _persist_trade(self, scalp, exit_mid, pnl, pnl_pct, reason, held_s, exit_ctx):
         try:
             c = sqlite3.connect(DB_PATH)
-            c.execute("INSERT INTO scalp_trades (ts,occ,underlying,direction,qty,entry,exit,pnl,reason) VALUES (?,?,?,?,?,?,?,?,?)",
-                      (int(time.time() * 1000), scalp.occ, scalp.underlying, scalp.direction, scalp.qty, scalp.entry_mid, exit_mid, pnl, reason))
+            c.execute(
+                "INSERT INTO scalp_trades (ts,occ,underlying,direction,qty,entry,exit,pnl,pnl_pct,reason,held_s,opened_ts,entry_ctx,exit_ctx) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (int(time.time() * 1000), scalp.occ, scalp.underlying, scalp.direction, scalp.qty,
+                 scalp.entry_mid, exit_mid, pnl, round(pnl_pct, 4), reason, round(held_s, 1),
+                 int(scalp.opened_at.timestamp() * 1000),
+                 json.dumps(scalp.entry_ctx), json.dumps(exit_ctx)))
             c.commit(); c.close()
         except Exception as e:
             logger.debug("persist trade failed: %s", e)

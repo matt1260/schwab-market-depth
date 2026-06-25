@@ -153,6 +153,7 @@ async def scalper_config(body: dict):
     skip = ("signal_mode", "ai_supervisor_seconds", "ai_tune_seconds")
     applied = eng._apply_runtime_params({k: v for k, v in body.items() if k not in skip})
     applied.update(cadence)
+    eng.save_state()  # persist across restarts
     return {"signal_mode": eng.signal_mode, "applied": applied}
 
 
@@ -163,6 +164,33 @@ async def scalper_chart(symbol: str):
     if eng is None:
         return {"symbol": symbol, "series": []}
     return {"symbol": symbol, "series": eng.chart_history(symbol)}
+
+
+@app.get("/scalper/markers/{symbol}")
+async def scalper_markers(symbol: str):
+    """Entry/exit markers for a symbol's underlying chart, from trade history.
+    Each: {entry_t, entry_px, exit_t, exit_px, direction, pnl, reason}."""
+    try:
+        import json as _json
+        sc = sqlite3.connect(_os.path.join(DATA_DIR, "scalper.db"))
+        sc.row_factory = sqlite3.Row
+        rows = sc.execute("SELECT * FROM scalp_trades WHERE underlying=? ORDER BY ts DESC LIMIT 50", (symbol,)).fetchall()
+        sc.close()
+        out = []
+        for r in rows:
+            r = dict(r)
+            ectx = _json.loads(r.get("entry_ctx") or "{}") if r.get("entry_ctx") else {}
+            xctx = _json.loads(r.get("exit_ctx") or "{}") if r.get("exit_ctx") else {}
+            out.append({
+                "entry_t": int((r.get("opened_ts") or r["ts"]) / 1000),
+                "entry_px": ectx.get("underlying"),
+                "exit_t": int(r["ts"] / 1000),
+                "exit_px": xctx.get("underlying"),
+                "direction": r.get("direction"), "pnl": r.get("pnl"), "reason": r.get("reason"),
+            })
+        return {"symbol": symbol, "markers": out}
+    except Exception:
+        return {"symbol": symbol, "markers": []}
 
 
 @app.get("/scalper/trades")
