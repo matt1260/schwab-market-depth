@@ -24,12 +24,12 @@ except:
     appSecret = None
     print("Failed to load environment variables. ")
 
-try:
-    client = schwabdev.Client(appKey, appSecret)
-    streamer = client.stream
-    print("Connected to Schwab API")
-except Exception as e:
-    print(f"Failed to connect to Schwab API: {e}")
+# NOTE: this options-depth streamer is the original app and is OPT-IN now
+# (RUN_OPTIONS_STREAM=1). Don't build the client/streamer at import time — it
+# crashes on schwabdev 3.x (no client.stream attr) and runs even when we only
+# import `main` for the api. Build lazily inside main() instead.
+client = None
+streamer = None
 
 today_date = datetime.now().strftime('%y%m%d')
 # Use full path for the database file
@@ -252,7 +252,12 @@ def create_empty_data_for_symbol(symbol):
 
 def main():
     # Run in Schwab API mode
+    global client, streamer
     try:
+        # Build the client/streamer lazily (only when actually running this stream).
+        if streamer is None:
+            client = schwabdev.Client(appKey, appSecret)
+            streamer = getattr(client, "stream", None) or client.stream  # schwabdev 3.x exposes .stream
         # Start the streamer
         streamer.start(my_handler)
         

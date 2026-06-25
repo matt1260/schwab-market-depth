@@ -13,10 +13,40 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _install_certifi_ws_ssl() -> None:
+    """Force websockets.connect to verify against certifi's clean CA bundle.
+
+    On machines with an SSL-intercepting proxy/AV, the system trust store carries
+    a self-signed root that breaks verification of streamer-api.schwab.com, while
+    certifi's bundle verifies it fine (issuer DigiCert). schwabdev calls
+    websockets.connect() with no ssl= arg, so we wrap it to inject a certifi
+    context by default. This KEEPS verification on (not a downgrade) — it just
+    uses the correct CA bundle. Idempotent."""
+    try:
+        import certifi
+        import websockets
+        if getattr(websockets, "_certifi_patched", False):
+            return
+        _orig = websockets.connect
+        _ctx = ssl.create_default_context(cafile=certifi.where())
+
+        def _connect(uri, *args, **kwargs):
+            if str(uri).startswith("wss://") and "ssl" not in kwargs:
+                kwargs["ssl"] = _ctx
+            return _orig(uri, *args, **kwargs)
+
+        websockets.connect = _connect
+        websockets._certifi_patched = True
+        logger.info("Patched websockets.connect to use certifi CA bundle for wss.")
+    except Exception as e:
+        logger.warning("Could not install certifi ws SSL context: %s", e)
 
 _L1_FIELDS = "0,1,2,4,5,8"      # 1=bid 2=ask 4=bidSize 5=askSize
 _BOOK_FIELDS = "0,1,2,3"        # 2=bid levels, 3=ask levels; level 0=price 1=size
@@ -37,6 +67,7 @@ class SchwabEquityFeed:
     async def start(self):
         if self._running:
             return
+        _install_certifi_ws_ssl()  # fix intercepting-proxy SSL on the streamer wss
         import schwabdev  # uses .env SCHWAB_APP_KEY/SECRET + tokens.json
         import os
         client = schwabdev.Client(os.getenv("SCHWAB_APP_KEY"), os.getenv("SCHWAB_APP_SECRET"))
