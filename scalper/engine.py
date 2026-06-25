@@ -199,6 +199,16 @@ class ScalperEngine:
         except Exception:
             return None
 
+    async def _option_quote(self, occ: str) -> Dict[str, Any]:
+        """Real-time options quote — Schwab feed first (no 15-min lag), Alpaca only
+        as a fallback. Alpaca is otherwise used solely to SUBMIT orders."""
+        stream = self._get_stream()
+        if stream is not None and hasattr(stream, "option_quote"):
+            q = await asyncio.to_thread(stream.option_quote, occ)
+            if q and (q.get("mid_price") or q.get("bid")):
+                return q
+        return await asyncio.to_thread(self.alpaca.option_quote, occ)
+
     # ── indicator wrappers (bind engine state to pure indicators) ──────────
     def _latest_price(self, sym):
         w = self._prices.get(sym)
@@ -462,7 +472,7 @@ class ScalperEngine:
             scalp = self._open.get(occ)
             if scalp is None:
                 continue
-            snap = await asyncio.to_thread(self.alpaca.option_quote, occ)
+            snap = await self._option_quote(occ)
             mid = snap.get("mid_price") or snap.get("bid")
             held = (now - scalp.opened_at).total_seconds()
             er = self._efficiency_ratio(scalp.underlying)
@@ -582,7 +592,7 @@ class ScalperEngine:
         contracts.sort(key=lambda c: abs(c["strike"] - underlying_px))
         contract = contracts[0]
         occ = contract["symbol"]
-        snap = await asyncio.to_thread(self.alpaca.option_quote, occ)
+        snap = await self._option_quote(occ)
         ask = snap.get("ask") or snap.get("mid_price")
         if not ask or ask <= 0:
             return
@@ -706,6 +716,7 @@ class ScalperEngine:
             "win_rate": round(self._wins_today / self._exits_today, 2) if self._exits_today else None,
             "open_scalps": len(self._open),
             "symbols": self.symbols,
+            "options_quote_source": "schwab" if (self._get_stream() and hasattr(self._get_stream(), "option_quote")) else "alpaca",
             "tunables": {k: getattr(self, k) for k in _TUNE_SAFE_BANDS},
             "signals": {
                 s: {

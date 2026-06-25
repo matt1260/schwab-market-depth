@@ -53,12 +53,24 @@ _BOOK_FIELDS = "0,1,2,3"        # 2=bid levels, 3=ask levels; level 0=price 1=si
 _BOOK_DEPTH = 5
 
 
+def occ_to_schwab(occ: str) -> str:
+    """Convert a plain OCC symbol (Alpaca form, e.g. SPY260624C00737000) to the
+    space-padded form Schwab's quote API expects (root left-justified to 6:
+    'SPY   260624C00737000'). Returns the input unchanged if it doesn't match."""
+    import re
+    m = re.match(r"^([A-Z]{1,6})(\d{6}[CP]\d{8})$", occ or "")
+    if not m:
+        return occ
+    return m.group(1).ljust(6) + m.group(2)
+
+
 class SchwabEquityFeed:
     def __init__(self, symbols: List[str]):
         self.symbols = symbols
         self._snap: Dict[str, Dict[str, Any]] = {}
         self._stream = None
         self._running = False
+        self._client = None  # schwabdev Client for REST options quotes
 
     @property
     def running(self) -> bool:
@@ -71,6 +83,7 @@ class SchwabEquityFeed:
         import schwabdev  # uses .env SCHWAB_APP_KEY/SECRET + tokens.json
         import os
         client = schwabdev.Client(os.getenv("SCHWAB_APP_KEY"), os.getenv("SCHWAB_APP_SECRET"))
+        self._client = client
         from schwabdev.stream import StreamAsync
         self._stream = StreamAsync(client)
         self._running = True
@@ -132,3 +145,25 @@ class SchwabEquityFeed:
     def book_imbalance(self, sym) -> Optional[float]:
         s = self._snap.get(sym)
         return s.get("book_imbalance") if s else None
+
+    def option_quote(self, occ: str) -> Dict[str, Any]:
+        """Real-time options quote from Schwab (bid/ask/mid/mark + greeks). Blocking
+        REST call — the engine wraps it in asyncio.to_thread. Returns {} on failure."""
+        if self._client is None:
+            return {}
+        sym = occ_to_schwab(occ)
+        try:
+            r = self._client.quote(sym).json()
+            q = (r.get(sym, {}) or {}).get("quote", {}) or {}
+            bid = float(q.get("bidPrice", 0) or 0)
+            ask = float(q.get("askPrice", 0) or 0)
+            mark = q.get("mark")
+            mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (float(mark) if mark else max(bid, ask))
+            return {
+                "bid": bid, "ask": ask, "mid_price": mid,
+                "last": float(q.get("lastPrice", 0) or 0) or None,
+                "delta": q.get("delta"), "gamma": q.get("gamma"),
+            }
+        except Exception as e:
+            logger.debug("Schwab option quote failed %s: %s", occ, e)
+            return {}
