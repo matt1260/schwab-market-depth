@@ -6,7 +6,6 @@ export default function ScalperPanel({ apiBaseUrl }) {
   const [st, setSt] = useState(null);
   const [err, setErr] = useState(null);
   const [trades, setTrades] = useState([]);
-  const [chartSym, setChartSym] = useState(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -119,20 +118,17 @@ export default function ScalperPanel({ apiBaseUrl }) {
         </div>
       </div>
 
-      {/* live VWAP-ish chart */}
+      {/* live VWAP-ish charts — dual pane (one per symbol) */}
       <div className="glass p-4 rounded-xl">
-        <div className="flex items-center justify-between mb-2">
-          <div className="text-xs text-text-secondary">Live chart — price vs session mean (VWAP-ish) ±2σ</div>
-          <div className="flex gap-1">
-            {(st.symbols || []).map((sym) => (
-              <button key={sym} onClick={() => setChartSym(sym)}
-                className={`px-2 py-0.5 rounded text-[10px] font-semibold ${(chartSym || st.symbols?.[0]) === sym ? 'bg-blue-500 text-black' : 'bg-gray-700 text-gray-300'}`}>
-                {sym}
-              </button>
-            ))}
-          </div>
+        <div className="text-xs text-text-secondary mb-2">Live charts — price vs session mean (VWAP-ish) ±2σ</div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {(st.symbols || []).map((sym) => (
+            <div key={sym}>
+              <div className="text-[11px] font-bold text-blue-300 mb-1">{sym}</div>
+              <VwapChart apiBaseUrl={apiBaseUrl} symbol={sym} height={280} />
+            </div>
+          ))}
         </div>
-        <VwapChart apiBaseUrl={apiBaseUrl} symbol={chartSym || st.symbols?.[0]} />
       </div>
 
       {/* active strategy spec */}
