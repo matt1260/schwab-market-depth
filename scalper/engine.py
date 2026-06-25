@@ -77,6 +77,7 @@ class _OpenScalp:
         self.entry_premium = entry_mid * qty * 100
         self.order_id = order_id
         self.opened_at = datetime.utcnow()
+        self.opened_epoch_ms = int(time.time() * 1000)  # real epoch (utcnow().timestamp() is tz-wrong)
         self.peak_mid = entry_mid
         self.entry_ctx: Dict[str, Any] = {}  # signals snapshot captured at entry
 
@@ -814,7 +815,7 @@ class ScalperEngine:
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (int(time.time() * 1000), scalp.occ, scalp.underlying, scalp.direction, scalp.qty,
                  scalp.entry_mid, exit_mid, pnl, round(pnl_pct, 4), reason, round(held_s, 1),
-                 int(scalp.opened_at.timestamp() * 1000),
+                 scalp.opened_epoch_ms,
                  json.dumps(scalp.entry_ctx), json.dumps(exit_ctx)))
             c.commit(); c.close()
         except Exception as e:
