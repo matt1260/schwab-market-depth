@@ -158,13 +158,25 @@ export default function ScalperPanel({ apiBaseUrl }) {
       {/* recent trades */}
       <div className="glass p-4 rounded-xl">
         <div className="text-xs text-text-secondary mb-2">Recent trades</div>
-        <div className="space-y-1 max-h-60 overflow-y-auto text-xs font-mono">
+        <div className="space-y-1 max-h-72 overflow-y-auto text-xs font-mono">
           {trades.map((t) => (
-            <div key={t.id} className="flex justify-between border-b border-gray-800 pb-0.5">
-              <span>{new Date(t.ts).toLocaleTimeString()}</span>
-              <span>{t.direction} {t.underlying}</span>
-              <span className={t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}>${(t.pnl ?? 0).toFixed(0)}</span>
-              <span className="text-text-secondary">{t.reason}</span>
+            <div key={t.id} className="border-b border-gray-800 pb-1">
+              <div className="flex justify-between items-center">
+                <span className="text-text-secondary">{new Date(t.ts).toLocaleTimeString()}</span>
+                <span className={`font-bold ${t.direction === 'call' ? 'text-green-400' : 'text-red-400'}`}>
+                  {t.direction?.toUpperCase()} ×{t.qty ?? '?'}
+                </span>
+                <span className={t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+                  {(t.pnl ?? 0) >= 0 ? '+' : ''}${(t.pnl ?? 0).toFixed(0)}
+                  {t.pnl_pct != null && <span className="text-text-secondary"> ({(t.pnl_pct * 100).toFixed(0)}%)</span>}
+                </span>
+                <span className="text-text-secondary">{t.reason}</span>
+              </div>
+              <div className="flex justify-between text-[10px] text-slate-500">
+                <span className="text-sky-400/80">{prettyOcc(t.occ)}</span>
+                <span>{t.entry != null ? `$${t.entry?.toFixed(2)}` : '—'} → {t.exit != null ? `$${t.exit?.toFixed(2)}` : '—'}</span>
+                <span>{t.held_s != null ? `${Math.round(t.held_s)}s` : ''}</span>
+              </div>
             </div>
           ))}
           {!trades.length && <div className="text-text-secondary">No trades yet.</div>}
@@ -189,6 +201,13 @@ function Cadence({ label, valSec, opts, onPick }) {
       </div>
     </div>
   );
+}
+function prettyOcc(occ) {
+  if (!occ) return '—';
+  const m = occ.match(/^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$/);
+  if (!m) return occ;
+  const [, root, , mm, dd, cp, strike] = m;
+  return `${root} ${parseInt(mm)}/${parseInt(dd)} ${parseInt(strike) / 1000}${cp}`;
 }
 const fmt = (v) => (v == null ? '—' : typeof v === 'number' ? v.toFixed(3) : String(v));
 const Stat = ({ label, val, color }) => (
