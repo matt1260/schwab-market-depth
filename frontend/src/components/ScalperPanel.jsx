@@ -158,28 +158,31 @@ export default function ScalperPanel({ apiBaseUrl }) {
       {/* recent trades */}
       <div className="glass p-4 rounded-xl">
         <div className="text-xs text-text-secondary mb-2">Recent trades</div>
-        <div className="space-y-1 max-h-72 overflow-y-auto text-xs font-mono">
-          {trades.map((t) => (
-            <div key={t.id} className="border-b border-gray-800 pb-1">
-              <div className="flex justify-between items-center">
-                <span className="text-text-secondary">{new Date(t.ts).toLocaleTimeString()}</span>
-                <span className={`font-bold ${t.direction === 'call' ? 'text-green-400' : 'text-red-400'}`}>
-                  {t.direction?.toUpperCase()} ×{t.qty ?? '?'}
-                </span>
-                <span className={t.pnl >= 0 ? 'text-green-400' : 'text-red-400'}>
-                  {(t.pnl ?? 0) >= 0 ? '+' : ''}${(t.pnl ?? 0).toFixed(0)}
-                  {t.pnl_pct != null && <span className="text-text-secondary"> ({(t.pnl_pct * 100).toFixed(0)}%)</span>}
-                </span>
-                <span className="text-text-secondary">{t.reason}</span>
-              </div>
-              <div className="flex justify-between text-[10px] text-slate-500">
-                <span className="text-sky-400/80">{prettyOcc(t.occ)}</span>
-                <span>{t.entry != null ? `$${t.entry?.toFixed(2)}` : '—'} → {t.exit != null ? `$${t.exit?.toFixed(2)}` : '—'}</span>
-                <span>{t.held_s != null ? `${Math.round(t.held_s)}s` : ''}</span>
-              </div>
-            </div>
-          ))}
-          {!trades.length && <div className="text-text-secondary">No trades yet.</div>}
+        {/* aligned grid: time | contract | qty | entry→exit | P&L | % | held | reason */}
+        <div className="text-[11px] font-mono">
+          <div className="grid grid-cols-[64px_110px_36px_104px_64px_48px_44px_1fr] gap-x-2 px-1 pb-1 text-[10px] text-text-secondary uppercase tracking-wide border-b border-gray-700">
+            <span>Time</span><span>Contract</span><span className="text-right">Qty</span>
+            <span className="text-right">Entry→Exit</span><span className="text-right">P&amp;L</span>
+            <span className="text-right">%</span><span className="text-right">Held</span><span>Exit</span>
+          </div>
+          <div className="max-h-72 overflow-y-auto">
+            {trades.map((t) => {
+              const win = (t.pnl ?? 0) >= 0;
+              return (
+                <div key={t.id} className="grid grid-cols-[64px_110px_36px_104px_64px_48px_44px_1fr] gap-x-2 px-1 py-0.5 border-b border-gray-800/60 items-center">
+                  <span className="text-slate-500">{new Date(t.ts).toLocaleTimeString([], { hour12: false })}</span>
+                  <span className={t.direction === 'call' ? 'text-green-400' : 'text-red-400'}>{prettyOcc(t.occ)}</span>
+                  <span className="text-right text-slate-400">{t.qty ?? '?'}</span>
+                  <span className="text-right text-slate-400">{t.entry != null ? t.entry.toFixed(2) : '—'}→{t.exit != null ? t.exit.toFixed(2) : '—'}</span>
+                  <span className={`text-right font-bold ${win ? 'text-green-400' : 'text-red-400'}`}>{win ? '+' : ''}{(t.pnl ?? 0).toFixed(0)}</span>
+                  <span className={`text-right ${win ? 'text-green-400/70' : 'text-red-400/70'}`}>{t.pnl_pct != null ? `${(t.pnl_pct * 100).toFixed(0)}%` : ''}</span>
+                  <span className="text-right text-slate-500">{t.held_s != null ? `${Math.round(t.held_s)}s` : ''}</span>
+                  <span className="text-slate-500 truncate">{t.reason}</span>
+                </div>
+              );
+            })}
+            {!trades.length && <div className="text-text-secondary px-1 py-2">No trades yet.</div>}
+          </div>
         </div>
       </div>
     </div>
