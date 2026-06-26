@@ -159,7 +159,8 @@ class ScalperEngine:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._init_db()
-        self._load_state()  # restore enabled/mode/tunables across restarts
+        self._load_state()       # restore enabled/mode/tunables across restarts
+        self._rehydrate_today()  # rebuild day P&L/wins/exits from persisted trades
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     async def start(self):
@@ -217,6 +218,37 @@ class ScalperEngine:
             logger.info("Restored scalper state: enabled=%s mode=%s", self.enabled, self.signal_mode)
         except Exception as e:
             logger.debug("load_state failed: %s", e)
+
+    def _rehydrate_today(self):
+        """Rebuild today's P&L / wins / exits / entries from persisted trades so a
+        restart doesn't zero the day's stats (trades persist in SQLite; the
+        in-memory aggregates didn't). Day boundary = local midnight."""
+        try:
+            import time as _t
+            day_start_ms = int(datetime.combine(date.today(), datetime.min.time()).timestamp() * 1000)
+            c = sqlite3.connect(DB_PATH)
+            rows = c.execute(
+                "SELECT pnl, opened_ts FROM scalp_trades WHERE ts >= ?", (day_start_ms,)
+            ).fetchall()
+            c.close()
+            if not rows:
+                return
+            pnl_run = 0.0; peak = 0.0; wins = 0
+            for pnl, _opened in rows:
+                p = float(pnl or 0)
+                pnl_run += p
+                if p > 0:
+                    wins += 1
+                if pnl_run > peak:
+                    peak = pnl_run
+            self._daily_realized_pnl = pnl_run
+            self._daily_peak_pnl = peak
+            self._exits_today = len(rows)
+            self._wins_today = wins
+            self._entries_today = len(rows)  # each closed trade had an entry
+            logger.info("Rehydrated today: pnl=$%.0f exits=%d wins=%d", pnl_run, len(rows), wins)
+        except Exception as e:
+            logger.debug("rehydrate_today failed: %s", e)
 
     # ── ingest prices from the Schwab stream ───────────────────────────────
     def _ingest_prices(self):
