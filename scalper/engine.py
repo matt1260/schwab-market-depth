@@ -150,6 +150,7 @@ class ScalperEngine:
         self._ai_assessment: Optional[str] = None
         self._ai_levels: Dict[str, Any] = {}
         self._ai_error: Optional[str] = None
+        self._ai_fail_streak: int = 0  # consecutive supervisor parse failures
         self._ai_log: Deque[Dict[str, Any]] = deque(maxlen=40)
         self._ai_last_run: Optional[datetime] = None
         self._ai_tune_last_run: Optional[datetime] = None
@@ -761,13 +762,15 @@ class ScalperEngine:
             last_tune=self._ai_log[0] if self._ai_log else None,
         )
         data = await sup.run_supervisor_call(self._anthropic_key, prompt, deep)
-        if not data:
-            self._ai_error = "unparseable / no response"
+        if not data or str(data.get("mode", "")).lower().strip() not in ("momentum", "fade", "pause"):
+            # Transient LLM JSON blips are normal — only surface an error after
+            # several CONSECUTIVE failures, and keep the last good mode running.
+            self._ai_fail_streak = getattr(self, "_ai_fail_streak", 0) + 1
+            if self._ai_fail_streak >= 3:
+                self._ai_error = f"AI unparseable ×{self._ai_fail_streak} (using last mode: {self._ai_mode})"
             return
         mode = str(data.get("mode", "")).lower().strip()
-        if mode not in ("momentum", "fade", "pause"):
-            self._ai_error = "no valid mode"
-            return
+        self._ai_fail_streak = 0
         self._ai_mode = mode
         self._ai_reason = str(data.get("reason", ""))[:120]
         self._ai_levels = data.get("levels", {}) or {}
