@@ -101,8 +101,17 @@ async def _start_scalper():
         feed = SchwabEquityFeed(SCALPER_SYMBOLS)
         alpaca = AlpacaExec(_os.getenv("ALPACA_API_KEY"), _os.getenv("ALPACA_API_SECRET"),
                             paper=str(_os.getenv("ALPACA_PAPER", "true")).lower() != "false")
+        # Optional LIVE (real-money) Alpaca client — built ONLY if live keys exist.
+        alpaca_live = None
+        _lk, _ls = _os.getenv("ALPACA_LIVE_API_KEY"), _os.getenv("ALPACA_LIVE_API_SECRET")
+        if _lk and _ls:
+            try:
+                alpaca_live = AlpacaExec(_lk, _ls, paper=False)
+                print("LIVE Alpaca client built (real money) — available but NOT active until toggled")
+            except Exception as _le:
+                print(f"LIVE Alpaca client failed to build: {_le}")
         engine = ScalperEngine(SCALPER_SYMBOLS, stream_getter=lambda: feed, alpaca=alpaca,
-                               anthropic_key=_os.getenv("ANTHROPIC_API_KEY"))
+                               anthropic_key=_os.getenv("ANTHROPIC_API_KEY"), alpaca_live=alpaca_live)
         _scalper["feed"], _scalper["engine"] = feed, engine
         await feed.start()   # opens Schwab L1+L2 stream (re-auth in browser on first run)
         await engine.start() # loop runs; enabled=False until toggled
@@ -131,6 +140,44 @@ async def scalper_toggle(body: dict):
         raise HTTPException(503, "Scalper not initialized")
     eng.set_enabled(bool(body.get("enabled")))
     return {"enabled": eng.enabled}
+
+
+@app.post("/scalper/live")
+async def scalper_live(body: dict):
+    """Switch execution between PAPER and LIVE (real money). Guarded: refuses LIVE
+    unless live Alpaca keys were configured. Live never auto-persists across
+    restarts (defaults back to paper). Returns the resulting mode + live account
+    equity (read-only) so the UI can confirm the real account is reachable."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    want_live = bool(body.get("live"))
+    res = eng.set_live_trading(want_live)
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "Could not switch to live"))
+    # On switching live, report the LIVE account equity as a reachability check.
+    if eng.live_trading:
+        try:
+            res["live_equity"] = await __import__("asyncio").to_thread(eng.alpaca.equity)
+        except Exception as e:
+            res["live_equity_error"] = str(e)
+    return res
+
+
+@app.get("/scalper/live/check")
+async def scalper_live_check():
+    """Read-only readiness check for live trading WITHOUT switching: are live keys
+    present, and is the live account reachable + funded? Never places an order."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    out = {"live_available": eng._alpaca_live is not None, "live_trading": eng.live_trading}
+    if eng._alpaca_live is not None:
+        try:
+            out["live_equity"] = await __import__("asyncio").to_thread(eng._alpaca_live.equity)
+        except Exception as e:
+            out["live_error"] = str(e)
+    return out
 
 
 @app.post("/scalper/config")

@@ -84,10 +84,13 @@ class _OpenScalp:
 
 class ScalperEngine:
     def __init__(self, symbols: List[str], stream_getter, alpaca: AlpacaExec,
-                 anthropic_key: Optional[str] = None):
+                 anthropic_key: Optional[str] = None, alpaca_live: Optional[AlpacaExec] = None):
         self.symbols = symbols
         self._get_stream = stream_getter  # returns the Schwab streamer wrapper (book_imbalance/latest mid)
-        self.alpaca = alpaca
+        self._alpaca_paper = alpaca
+        self._alpaca_live = alpaca_live   # None unless LIVE Alpaca keys were provided
+        self.live_trading = False         # REAL MONEY when True — default OFF, guarded
+        self.alpaca = self._alpaca_paper  # active execution client (paper by default)
         self._anthropic_key = anthropic_key
 
         # tunables (defaults mirror platform)
@@ -182,6 +185,27 @@ class ScalperEngine:
     def set_enabled(self, on: bool):
         self.enabled = on
         self._save_state()
+
+    def set_live_trading(self, on: bool) -> dict:
+        """Switch execution between PAPER and LIVE (real money). Guarded:
+        - LIVE requires a live Alpaca client (built only if ALPACA_LIVE_API_KEY/
+          SECRET were provided) — refuses otherwise.
+        - Always returns the resulting mode so the caller/UI can confirm.
+        Does NOT auto-enable trading; the engine's enabled flag is separate."""
+        if on:
+            if self._alpaca_live is None:
+                return {"ok": False, "live_trading": False,
+                        "error": "No live Alpaca keys configured (ALPACA_LIVE_API_KEY/SECRET). Staying on paper."}
+            self._alpaca_live = self._alpaca_live  # noqa (explicit)
+            self.live_trading = True
+            self.alpaca = self._alpaca_live
+            logger.warning("*** LIVE TRADING ENABLED — orders route to the REAL Alpaca account ***")
+        else:
+            self.live_trading = False
+            self.alpaca = self._alpaca_paper
+            logger.info("Execution set to PAPER")
+        self._save_state()
+        return {"ok": True, "live_trading": self.live_trading}
 
     # ── state persistence (survive restarts) ───────────────────────────────
     _STATE_KEYS = ("signal_mode", "enabled", "entry_threshold", "stop_pct",
@@ -870,6 +894,8 @@ class ScalperEngine:
     def status(self) -> Dict[str, Any]:
         return {
             "enabled": self.enabled, "running": self._running, "signal_mode": self.signal_mode,
+            "live_trading": self.live_trading,
+            "live_available": self._alpaca_live is not None,
             "ai_mode": self._ai_mode, "ai_reason": self._ai_reason, "ai_assessment": self._ai_assessment,
             "ai_error": self._ai_error, "ai_log": list(self._ai_log)[:20],
             "active_strategy_spec": self._active_strategy_spec,

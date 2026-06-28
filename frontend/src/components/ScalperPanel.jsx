@@ -35,6 +35,27 @@ export default function ScalperPanel({ apiBaseUrl }) {
     refresh();
   };
 
+  const toggleLive = async () => {
+    if (!st.live_trading) {
+      // arming LIVE — real money: require explicit typed confirmation
+      const ok = window.confirm(
+        '⚠️ SWITCH TO LIVE — REAL MONEY?\n\nOrders will route to your funded Alpaca LIVE account. ' +
+        'This is a thin, still-being-validated strategy. Click OK only if you intend to trade real money.'
+      );
+      if (!ok) return;
+      const res = await fetch(`${apiBaseUrl}/scalper/live`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ live: true }),
+      });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); alert('Live switch refused: ' + (e.detail || res.status)); }
+      else { const d = await res.json(); alert(`LIVE active. Live account equity: $${d.live_equity ?? '?'}`); }
+    } else {
+      await fetch(`${apiBaseUrl}/scalper/live`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ live: false }),
+      });
+    }
+    refresh();
+  };
+
   if (err) return <div className="glass p-6 rounded-xl text-red-400">Scalper API error: {err}</div>;
   if (!st) return <div className="text-text-secondary p-6">Loading scalper…</div>;
   if (!st.available) return <div className="glass p-6 rounded-xl text-yellow-400">Scalper not initialized — check the API server logs (Schwab re-auth may be required).</div>;
@@ -45,19 +66,35 @@ export default function ScalperPanel({ apiBaseUrl }) {
   return (
     <div className="space-y-4">
       {/* header / master switch */}
-      <div className="glass p-4 rounded-xl flex items-center justify-between">
+      <div className={`glass p-4 rounded-xl flex items-center justify-between ${st.live_trading ? 'ring-2 ring-red-500' : ''}`}>
         <div>
-          <div className="text-lg font-bold text-blue-400">Scalper (sandbox)</div>
+          <div className="text-lg font-bold text-blue-400">
+            Scalper {st.live_trading
+              ? <span className="text-red-400">· 🔴 LIVE — REAL MONEY</span>
+              : <span className="text-text-secondary">· 📝 paper</span>}
+          </div>
           <div className="text-xs text-text-secondary">
-            {st.symbols?.join(', ')} · feed {st.feed_running ? '🟢 live' : '🔴 down'} · Alpaca paper
+            {st.symbols?.join(', ')} · feed {st.feed_running ? '🟢 live' : '🔴 down'} · {st.live_trading ? 'Alpaca LIVE' : 'Alpaca paper'}
           </div>
         </div>
-        <button
-          onClick={() => post('/scalper/toggle', { enabled: !st.enabled })}
-          className={`px-4 py-1.5 rounded font-bold ${st.enabled ? 'bg-green-500 text-black' : 'bg-gray-600 text-white'}`}
-        >
-          {st.enabled ? 'ON' : 'OFF'}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={toggleLive}
+            disabled={!st.live_available && !st.live_trading}
+            title={!st.live_available ? 'No live Alpaca keys configured' : ''}
+            className={`px-3 py-1.5 rounded text-xs font-bold transition-colors disabled:opacity-40 ${
+              st.live_trading ? 'bg-red-600 text-white hover:bg-red-500' : 'bg-secondary text-text-secondary hover:bg-secondary/70'
+            }`}
+          >
+            {st.live_trading ? 'LIVE ✓ (click for paper)' : st.live_available ? 'Go LIVE 💵' : 'LIVE (no keys)'}
+          </button>
+          <button
+            onClick={() => post('/scalper/toggle', { enabled: !st.enabled })}
+            className={`px-4 py-1.5 rounded font-bold ${st.enabled ? 'bg-green-500 text-black' : 'bg-gray-600 text-white'}`}
+          >
+            {st.enabled ? 'ON' : 'OFF'}
+          </button>
+        </div>
       </div>
 
       {(st.kill_switch_tripped || st.profit_lock_tripped) && (
