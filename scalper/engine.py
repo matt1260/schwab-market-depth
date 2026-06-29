@@ -218,7 +218,7 @@ class ScalperEngine:
                    "min_recent_range_pct", "chop_guard_enabled", "velocity_gate_enabled",
                    "profit_lock_arm_usd", "profit_giveback_frac",
                    "ai_supervisor_seconds", "ai_tune_seconds", "max_concurrent",
-                   "per_trade_usd", "budget_usd", "max_dte")
+                   "per_trade_usd", "budget_usd", "max_dte", "daily_loss_kill_usd")
 
     def _state_path(self):
         return os.path.join(os.path.dirname(DB_PATH), "scalper_state.json")
