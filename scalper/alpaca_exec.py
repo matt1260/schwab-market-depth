@@ -30,6 +30,24 @@ class AlpacaExec:
             logger.warning("Alpaca equity fetch failed: %s", e)
             return None
 
+    def account_health(self) -> Dict[str, Any]:
+        """Full account reachability/readiness — surfaces the real error instead
+        of swallowing it. Used to gate live trading (don't go live on an account
+        that's unauthorized, unfunded, blocked, or not options-approved)."""
+        try:
+            a = self._trading.get_account()
+            equity = float(a.equity)
+            opt_lvl = getattr(a, "options_trading_level", None) or getattr(a, "options_approved_level", None)
+            ok = (str(a.status) in ("AccountStatus.ACTIVE", "ACTIVE")
+                  and not a.account_blocked and not a.trading_blocked
+                  and equity > 0 and (opt_lvl or 0) >= 1)
+            return {"ok": ok, "status": str(a.status), "equity": equity,
+                    "cash": float(a.cash), "buying_power": float(a.buying_power),
+                    "options_level": opt_lvl,
+                    "account_blocked": a.account_blocked, "trading_blocked": a.trading_blocked}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     # ── chain discovery ───────────────────────────────────────────────────
     def find_contracts(self, underlying: str, opt_type: str, max_dte: int) -> List[Dict[str, Any]]:
         """Near-the-money 0..max_dte contracts for the underlying. opt_type: call|put."""

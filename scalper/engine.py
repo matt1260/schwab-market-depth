@@ -196,10 +196,15 @@ class ScalperEngine:
             if self._alpaca_live is None:
                 return {"ok": False, "live_trading": False,
                         "error": "No live Alpaca keys configured (ALPACA_LIVE_API_KEY/SECRET). Staying on paper."}
-            self._alpaca_live = self._alpaca_live  # noqa (explicit)
+            # Hard gate: verify the live account actually authenticates + is
+            # active/funded/options-approved BEFORE routing real orders to it.
+            health = self._alpaca_live.account_health()
+            if not health.get("ok"):
+                return {"ok": False, "live_trading": False,
+                        "error": f"Live account not ready: {health.get('error') or health}. Staying on paper."}
             self.live_trading = True
             self.alpaca = self._alpaca_live
-            logger.warning("*** LIVE TRADING ENABLED — orders route to the REAL Alpaca account ***")
+            logger.warning("*** LIVE TRADING ENABLED — orders route to the REAL Alpaca account (equity $%s) ***", health.get("equity"))
         else:
             self.live_trading = False
             self.alpaca = self._alpaca_paper

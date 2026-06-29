@@ -171,12 +171,13 @@ async def scalper_live_check():
     eng = _scalper["engine"]
     if eng is None:
         raise HTTPException(503, "Scalper not initialized")
-    out = {"live_available": eng._alpaca_live is not None, "live_trading": eng.live_trading}
+    out = {"live_keys_present": eng._alpaca_live is not None, "live_trading": eng.live_trading}
     if eng._alpaca_live is not None:
-        try:
-            out["live_equity"] = await __import__("asyncio").to_thread(eng._alpaca_live.equity)
-        except Exception as e:
-            out["live_error"] = str(e)
+        health = await __import__("asyncio").to_thread(eng._alpaca_live.account_health)
+        out["account"] = health
+        out["ready"] = bool(health.get("ok"))  # keys present AND account active/funded/options-approved
+    else:
+        out["ready"] = False
     return out
 
 
