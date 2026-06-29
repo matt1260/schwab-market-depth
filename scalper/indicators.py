@@ -16,7 +16,8 @@ PRICE_WINDOW = 40
 REGIME_WINDOW = 16
 REGIME_THRESHOLD = 0.72
 REGIME_SAMPLE_SECONDS = 15
-REGIME_ER_WINDOW = 40
+REGIME_ER_WINDOW = 40       # full buffer kept (~10 min) for range/levels/mtf
+ER_WINDOW = 16             # ER computed over the recent ~4 min (scalp horizon)
 REGIME_ER_MIN_SAMPLES = 8
 THRUST_WINDOW_SAMPLES = 12
 THRUST_MIN_ER = 0.70
@@ -50,10 +51,16 @@ AUTO_MIDRANGE_SKIP = True
 
 
 def efficiency_ratio(samples: Optional[Deque]) -> Optional[float]:
-    """Kaufman ER over the coarse regime series; ~1 trend, ~0 chop."""
+    """Kaufman ER over the RECENT regime sub-window (scalp horizon), not the full
+    10-min buffer. The full window made big moves that ROUND-TRIP (e.g. a pop then
+    a flush) read net≈0 → false 'dead chop' even with strong 1-2 min legs. ER on
+    the last ~ER_WINDOW samples (~4 min @ 15s) reflects the CURRENT leg, which is
+    what a 1-3 min scalp actually trades."""
     if not samples or len(samples) < REGIME_ER_MIN_SAMPLES:
         return None
-    prices = [p for _, p in samples]
+    prices = [p for _, p in samples][-ER_WINDOW:]
+    if len(prices) < REGIME_ER_MIN_SAMPLES:
+        return None
     net = abs(prices[-1] - prices[0])
     path = sum(abs(prices[k] - prices[k - 1]) for k in range(1, len(prices)))
     return (net / path) if path > 0 else None
