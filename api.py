@@ -198,9 +198,26 @@ async def scalper_config(body: dict):
     if "ai_tune_seconds" in body:
         eng.ai_tune_seconds = max(60, min(3600, int(body["ai_tune_seconds"])))
         cadence["ai_tune_seconds"] = eng.ai_tune_seconds
-    skip = ("signal_mode", "ai_supervisor_seconds", "ai_tune_seconds")
+    # Operator-only risk/sizing controls (NOT AI-tunable — the supervisor must
+    # never change position size or the kill switch). Clamped to sane floors.
+    risk = {}
+    if "per_trade_usd" in body:
+        eng.per_trade_usd = max(10.0, float(body["per_trade_usd"]))
+        risk["per_trade_usd"] = eng.per_trade_usd
+    if "max_concurrent" in body:
+        eng.max_concurrent = max(1, int(body["max_concurrent"]))
+        risk["max_concurrent"] = eng.max_concurrent
+    if "daily_loss_kill_usd" in body:
+        eng.daily_loss_kill_usd = max(10.0, float(body["daily_loss_kill_usd"]))
+        risk["daily_loss_kill_usd"] = eng.daily_loss_kill_usd
+    if "budget_usd" in body:
+        eng.budget_usd = max(10.0, float(body["budget_usd"]))
+        risk["budget_usd"] = eng.budget_usd
+    skip = ("signal_mode", "ai_supervisor_seconds", "ai_tune_seconds",
+            "per_trade_usd", "max_concurrent", "daily_loss_kill_usd", "budget_usd")
     applied = eng._apply_runtime_params({k: v for k, v in body.items() if k not in skip})
     applied.update(cadence)
+    applied.update(risk)
     eng.save_state()  # persist across restarts
     return {"signal_mode": eng.signal_mode, "applied": applied}
 

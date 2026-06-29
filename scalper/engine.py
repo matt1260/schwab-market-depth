@@ -918,6 +918,10 @@ class ScalperEngine:
                 } for sc in self._open.values()
             ],
             "symbols": self.symbols,
+            "per_trade_usd": self.per_trade_usd,
+            "max_concurrent": self.max_concurrent,
+            "daily_loss_kill_usd": self.daily_loss_kill_usd,
+            "budget_usd": self.budget_usd,
             "ai_supervisor_seconds": self.ai_supervisor_seconds,
             "ai_tune_seconds": self.ai_tune_seconds,
             "options_quote_source": "schwab" if (self._get_stream() and hasattr(self._get_stream(), "option_quote")) else "alpaca",
