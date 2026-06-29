@@ -48,9 +48,12 @@ _TUNE_SAFE_BANDS: Dict[str, Tuple[float, float]] = {
     "min_recent_range_pct": (0.0, 1.5),
     "profit_lock_arm_usd": (0.0, 5000.0),
     "profit_giveback_frac": (0.05, 0.95),
+    # Adaptive resolution — AI tunes the timescale to the regime:
+    "regime_sample_seconds": (5, 60),   # finer for fast moves, coarser for slow grinds
+    "er_window": (8, 40),               # how many samples ER spans
 }
 _TUNE_BOOL_KEYS = ("chop_guard_enabled", "velocity_gate_enabled")
-_TUNE_INT_KEYS = ("time_stop_seconds",)
+_TUNE_INT_KEYS = ("time_stop_seconds", "regime_sample_seconds", "er_window")
 _DSL_OPS = {">", "<", ">=", "<=", "between", "==", "and", "or", "not"}
 _DSL_ACTIONS = {"call", "put", "with_momentum", "fade", "skip"}
 _DSL_SIGNALS = {
@@ -118,6 +121,13 @@ class ScalperEngine:
         self.ai_tune_seconds = 600
         self.daily_entry_start_utc: Optional[int] = None
         self.daily_entry_end_utc: Optional[int] = None
+        # Adaptive resolution (AI-tunable): how the regime/ER series is sampled.
+        # regime_sample_seconds = spacing between samples (coarser = sees slow
+        # grinds, finer = sees fast moves). er_window = how many recent samples ER
+        # spans. The AI adjusts these per regime so a slow drift isn't drowned by
+        # tick noise (low res) nor a fast move smeared (too coarse).
+        self.regime_sample_seconds = ind.REGIME_SAMPLE_SECONDS  # 15
+        self.er_window = ind.ER_WINDOW                          # 16 (~4 min @ 15s)
 
         # state
         self._prices: Dict[str, Deque[Tuple[datetime, float]]] = {s: deque(maxlen=ind.PRICE_WINDOW) for s in symbols}
@@ -218,7 +228,9 @@ class ScalperEngine:
                    "min_recent_range_pct", "chop_guard_enabled", "velocity_gate_enabled",
                    "profit_lock_arm_usd", "profit_giveback_frac",
                    "ai_supervisor_seconds", "ai_tune_seconds", "max_concurrent",
-                   "per_trade_usd", "budget_usd", "max_dte", "daily_loss_kill_usd")
+                   "per_trade_usd", "budget_usd", "max_dte", "daily_loss_kill_usd",
+                   "daily_entry_start_utc", "daily_entry_end_utc",
+                   "regime_sample_seconds", "er_window")
 
     def _state_path(self):
         return os.path.join(os.path.dirname(DB_PATH), "scalper_state.json")
@@ -323,7 +335,7 @@ class ScalperEngine:
         self._anchor_n[sym] = self._anchor_n.get(sym, 0) + 1
         self._anchor_sq[sym] = self._anchor_sq.get(sym, 0.0) + px * px
         s = self._regime_samples.setdefault(sym, deque(maxlen=ind.REGIME_ER_WINDOW))
-        if s and (now - s[-1][0]).total_seconds() < ind.REGIME_SAMPLE_SECONDS:
+        if s and (now - s[-1][0]).total_seconds() < self.regime_sample_seconds:
             return
         s.append((now, px))
 
@@ -360,7 +372,7 @@ class ScalperEngine:
         w = self._prices.get(sym)
         return w[-1][1] if w else None
 
-    def _efficiency_ratio(self, sym): return ind.efficiency_ratio(self._regime_samples.get(sym))
+    def _efficiency_ratio(self, sym): return ind.efficiency_ratio(self._regime_samples.get(sym), self.er_window)
     def _recent_range_pct(self, sym): return ind.recent_range_pct(self._regime_samples.get(sym))
     def _short_thrust(self, sym): return ind.short_thrust(self._regime_samples.get(sym))
     def _mtf_trend(self, sym): return ind.mtf_trend(self._regime_samples.get(sym))
@@ -804,10 +816,18 @@ class ScalperEngine:
             self._ai_tune_last_run = now
         tape = {}
         for s in self.symbols:
+            smp = self._regime_samples.get(s)
+            # Multi-resolution ER so the AI can SEE the timescale mismatch: if ER
+            # is low at a fine window but high at a coarse one, it's a slow grind
+            # → the AI should coarsen regime_sample_seconds / widen er_window.
+            er_fast = ind.efficiency_ratio(smp, 8)    # ~recent, fine
+            er_slow = ind.efficiency_ratio(smp, 32)   # broader
             tape[s] = {
                 "last": round(self._latest_price(s), 2) if self._latest_price(s) else None,
                 "session_vwap_ish": round(self._anchored_mean(s), 2) if self._anchored_mean(s) else None,
                 "efficiency_ratio": round(self._efficiency_ratio(s), 3) if self._efficiency_ratio(s) is not None else None,
+                "er_fast_8": round(er_fast, 3) if er_fast is not None else None,
+                "er_slow_32": round(er_slow, 3) if er_slow is not None else None,
                 "recent_range_pct": round(self._recent_range_pct(s), 3) if self._recent_range_pct(s) is not None else None,
                 "book_imbalance": round(self._book_imbalance(s), 2) if self._book_imbalance(s) is not None else None,
             }
@@ -922,6 +942,10 @@ class ScalperEngine:
             "max_concurrent": self.max_concurrent,
             "daily_loss_kill_usd": self.daily_loss_kill_usd,
             "budget_usd": self.budget_usd,
+            "daily_entry_start_utc": self.daily_entry_start_utc,
+            "daily_entry_end_utc": self.daily_entry_end_utc,
+            "regime_sample_seconds": self.regime_sample_seconds,
+            "er_window": self.er_window,
             "ai_supervisor_seconds": self.ai_supervisor_seconds,
             "ai_tune_seconds": self.ai_tune_seconds,
             "options_quote_source": "schwab" if (self._get_stream() and hasattr(self._get_stream(), "option_quote")) else "alpaca",

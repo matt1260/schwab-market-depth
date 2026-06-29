@@ -50,15 +50,15 @@ LEVEL_REVERSION_STRENGTH = 0.85
 AUTO_MIDRANGE_SKIP = True
 
 
-def efficiency_ratio(samples: Optional[Deque]) -> Optional[float]:
+def efficiency_ratio(samples: Optional[Deque], window: int = ER_WINDOW) -> Optional[float]:
     """Kaufman ER over the RECENT regime sub-window (scalp horizon), not the full
     10-min buffer. The full window made big moves that ROUND-TRIP (e.g. a pop then
     a flush) read net≈0 → false 'dead chop' even with strong 1-2 min legs. ER on
-    the last ~ER_WINDOW samples (~4 min @ 15s) reflects the CURRENT leg, which is
-    what a 1-3 min scalp actually trades."""
+    the last ~window samples reflects the CURRENT leg. `window` is AI-tunable so a
+    slow grind (coarse) vs fast move (fine) each read correctly."""
     if not samples or len(samples) < REGIME_ER_MIN_SAMPLES:
         return None
-    prices = [p for _, p in samples][-ER_WINDOW:]
+    prices = [p for _, p in samples][-window:]
     if len(prices) < REGIME_ER_MIN_SAMPLES:
         return None
     net = abs(prices[-1] - prices[0])
