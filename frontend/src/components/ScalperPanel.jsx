@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback } from 'react';
 import CandleChart from './CandleChart';
 import ConfirmCard from './ConfirmCard';
 import { PositionsPanel, OptionsLadder } from './PositionsPanel';
+import PnlMeter from './PnlMeter';
 
 export default function ScalperPanel({ apiBaseUrl }) {
   const [st, setSt] = useState(null);
@@ -332,12 +333,17 @@ export default function ScalperPanel({ apiBaseUrl }) {
       <div className="glass p-4 rounded-xl">
         <div className="text-xs text-text-secondary mb-2">Live charts — 1-min candles · EMA 9 / 21 / 50 · crossover signals (on candle close)</div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {(st.symbols || []).map((sym) => (
+          {(st.symbols || []).map((sym) => {
+            const pos = (st.open_positions || []).find((p) => p.underlying === sym);
+            return (
             <div key={sym}>
               <div className="text-[11px] font-bold text-blue-300 mb-1">{sym}</div>
+              {/* live P&L thermometer — only when a position is open for this symbol */}
+              {pos && <PnlMeter position={pos} />}
               <CandleChart apiBaseUrl={apiBaseUrl} symbol={sym} height={300} />
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 

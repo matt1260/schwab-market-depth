@@ -142,6 +142,7 @@ class _OpenScalp:
         self.opened_at = datetime.utcnow()
         self.opened_epoch_ms = int(time.time() * 1000)  # real epoch (utcnow().timestamp() is tz-wrong)
         self.peak_mid = entry_mid
+        self.trough_mid = entry_mid   # low-water mark (worst mid seen) for the P&L thermometer
         self.entry_underlying: Optional[float] = None  # underlying px at entry (for the underlying-based stop)
         self.tight_trail = False              # set by a big adverse candle → exit tightens
         self.hard_stop_underlying: Optional[float] = None  # reversal-candle stop (underlying px)
@@ -959,11 +960,20 @@ class ScalperEngine:
                 q = await self._option_quote(sc.occ)
                 mid = q.get("mid_price") or q.get("bid")
                 mid_f = float(mid) if mid else None
+                # track high/low-water marks for the P&L thermometer
+                if mid_f:
+                    if mid_f > sc.peak_mid:
+                        sc.peak_mid = mid_f
+                    if mid_f < sc.trough_mid:
+                        sc.trough_mid = mid_f
                 pnl_pct = ((mid_f - sc.entry_mid) / sc.entry_mid * 100.0) if (mid_f and sc.entry_mid) else None
                 pnl_usd = ((mid_f - sc.entry_mid) * sc.qty * 100.0) if (mid_f and sc.entry_mid) else None
                 peak_pct = ((sc.peak_mid - sc.entry_mid) / sc.entry_mid * 100.0) if sc.entry_mid else None
+                trough_pct = ((sc.trough_mid - sc.entry_mid) / sc.entry_mid * 100.0) if sc.entry_mid else None
+                peak_usd = ((sc.peak_mid - sc.entry_mid) * sc.qty * 100.0) if sc.entry_mid else None
+                trough_usd = ((sc.trough_mid - sc.entry_mid) * sc.qty * 100.0) if sc.entry_mid else None
             except Exception:
-                mid_f = pnl_pct = pnl_usd = peak_pct = None
+                mid_f = pnl_pct = pnl_usd = peak_pct = trough_pct = peak_usd = trough_usd = None
             out.append({
                 "occ": sc.occ, "scalp_key": sc.key, "underlying": sc.underlying,
                 "direction": sc.direction, "qty": sc.qty,
@@ -972,6 +982,9 @@ class ScalperEngine:
                 "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else None,
                 "pnl_usd": round(pnl_usd, 0) if pnl_usd is not None else None,
                 "peak_pct": round(peak_pct, 1) if peak_pct is not None else None,
+                "trough_pct": round(trough_pct, 1) if trough_pct is not None else None,
+                "peak_usd": round(peak_usd, 0) if peak_usd is not None else None,
+                "trough_usd": round(trough_usd, 0) if trough_usd is not None else None,
                 "strategy": getattr(sc, "strategy", None),
                 "held_s": round((datetime.utcnow() - sc.opened_at).total_seconds(), 0),
                 # config-fixed risk levels shown for context (the stop is engine-managed)
