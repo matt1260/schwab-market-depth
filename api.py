@@ -87,6 +87,8 @@ def get_db_connection():
 # ── Standalone scalper sandbox (Schwab L2 data + Alpaca paper exec + Opus AI) ──
 import os as _os
 _scalper = {"engine": None, "feed": None}
+_spreads = {"engine": None}
+_scanner = {"scanner": None}
 SCALPER_SYMBOLS = ["SPY", "QQQ"]
 
 
@@ -116,6 +118,32 @@ async def _start_scalper():
         await feed.start()   # opens Schwab L1+L2 stream (re-auth in browser on first run)
         await engine.start() # loop runs; enabled=False until toggled
         print("Scalper engine + Schwab equity feed started (engine disabled)")
+        # premium-SELLING core: put credit spreads (separate engine, shares feed+alpaca)
+        try:
+            from scalper.spreads import SpreadEngine
+            spread_eng = SpreadEngine(SCALPER_SYMBOLS, feed_getter=lambda: feed,
+                                      alpaca=alpaca, alpaca_live=alpaca_live)
+            _spreads["engine"] = spread_eng
+            await spread_eng.start()  # loop runs; enabled=False until toggled
+            print("Spread engine (put credit spreads) started (disabled)")
+        except Exception as _se:
+            import traceback as _tb
+            print(f"Spread engine startup failed (scalper still runs): {_se}")
+            _tb.print_exc()
+        # premium-selling SCANNER: rank the universe for the richest spread opportunities
+        try:
+            from scalper.scanner import PremiumScanner
+            scanner = PremiumScanner(alpaca, schwab_client_getter=lambda: getattr(feed, "_client", None))
+            _scanner["scanner"] = scanner
+            await scanner.start(interval_s=600)
+            # let the spread engine trade the scanner's ranked universe
+            if _spreads["engine"] is not None:
+                _spreads["engine"].set_scanner(scanner)
+            print("Premium scanner started (universe ranking every 10m); wired to spread engine")
+        except Exception as _sce:
+            import traceback as _tb
+            print(f"Scanner startup failed: {_sce}")
+            _tb.print_exc()
     except Exception as e:
         import traceback
         print(f"Scalper startup failed (UI still runs): {e}")
@@ -181,14 +209,26 @@ async def scalper_live_check():
     return out
 
 
+@app.post("/scalper/reset-kill")
+async def scalper_reset_kill():
+    """Manually clear the kill switch / profit lock (paper testing). Re-bases the
+    daily-loss baseline so it doesn't instantly re-trip on the existing drawdown."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    return eng.reset_kill()
+
+
 @app.post("/scalper/config")
 async def scalper_config(body: dict):
     """Set signal_mode and/or any tunable knob from the UI."""
     eng = _scalper["engine"]
     if eng is None:
         raise HTTPException(503, "Scalper not initialized")
-    if "signal_mode" in body and body["signal_mode"] in ("momentum", "fade", "auto", "ai"):
+    if "signal_mode" in body and body["signal_mode"] in ("momentum", "fade", "auto", "ai", "macross", "macross_x", "all", "apex"):
         eng.signal_mode = body["signal_mode"]
+        if eng.signal_mode != "ai":
+            eng._ai_enable_macross = False   # clear the AI's macross-alongside flag off 'ai' mode
     # AI supervision cadence (seconds). Clamp to sane ranges. ai_supervisor_seconds
     # = fast mode-check; ai_tune_seconds = slow deep tune/strategy cycle.
     cadence = {}
@@ -213,8 +253,24 @@ async def scalper_config(body: dict):
     if "budget_usd" in body:
         eng.budget_usd = max(10.0, float(body["budget_usd"]))
         risk["budget_usd"] = eng.budget_usd
+    # Trading window (minutes since UTC midnight). Gates entries to regular hours
+    # so it can't fire into illiquid pre/post-market. null clears that side.
+    if "daily_entry_start_utc" in body:
+        v = body["daily_entry_start_utc"]
+        eng.daily_entry_start_utc = int(v) if v is not None else None
+        risk["daily_entry_start_utc"] = eng.daily_entry_start_utc
+    if "daily_entry_end_utc" in body:
+        v = body["daily_entry_end_utc"]
+        eng.daily_entry_end_utc = int(v) if v is not None else None
+        risk["daily_entry_end_utc"] = eng.daily_entry_end_utc
+    # Post-open blackout: minutes to wait after the 09:30 ET open before scalping
+    # (operator setting, 0-120; 0 = trade from the bell).
+    if "open_blackout_minutes" in body:
+        eng.open_blackout_minutes = max(0, min(120, int(body["open_blackout_minutes"])))
+        risk["open_blackout_minutes"] = eng.open_blackout_minutes
     skip = ("signal_mode", "ai_supervisor_seconds", "ai_tune_seconds",
-            "per_trade_usd", "max_concurrent", "daily_loss_kill_usd", "budget_usd")
+            "per_trade_usd", "max_concurrent", "daily_loss_kill_usd", "budget_usd",
+            "open_blackout_minutes")
     applied = eng._apply_runtime_params({k: v for k, v in body.items() if k not in skip})
     applied.update(cadence)
     applied.update(risk)
@@ -229,6 +285,17 @@ async def scalper_chart(symbol: str):
     if eng is None:
         return {"symbol": symbol, "series": []}
     return {"symbol": symbol, "series": eng.chart_history(symbol)}
+
+
+@app.get("/scalper/candles/{symbol}")
+async def scalper_candles(symbol: str):
+    """1-min OHLC candles + 9/21/50 EMA overlays + 9×21 crossover markers for the
+    redesigned candlestick chart. All on the closed-bar basis the engine trades."""
+    eng = _scalper["engine"]
+    if eng is None:
+        return {"symbol": symbol, "bars": [], "emas": [], "live": None,
+                "ema_now": {}, "markers": []}
+    return eng.candles(symbol.upper())
 
 
 @app.get("/scalper/markers/{symbol}")
@@ -268,6 +335,89 @@ async def scalper_trades(limit: int = 100):
         return {"trades": [dict(r) for r in rows]}
     except Exception:
         return {"trades": []}
+
+
+# ── premium-selling core: put credit spreads ─────────────────────────────────
+@app.get("/spreads/status")
+async def spreads_status():
+    eng = _spreads["engine"]
+    if eng is None:
+        return {"available": False}
+    return eng.status()
+
+
+@app.post("/spreads/toggle")
+async def spreads_toggle(body: dict):
+    eng = _spreads["engine"]
+    if eng is None:
+        raise HTTPException(503, "Spread engine not initialized")
+    eng.set_enabled(bool(body.get("enabled")))
+    return {"enabled": eng.enabled}
+
+
+@app.post("/spreads/config")
+async def spreads_config(body: dict):
+    """Set spread strategy knobs (IVR gate, delta, width, DTE, management, sizing)."""
+    eng = _spreads["engine"]
+    if eng is None:
+        raise HTTPException(503, "Spread engine not initialized")
+    _float = {"ivr_min", "short_delta", "width", "profit_take_frac", "stop_credit_mult",
+              "max_loss_per_spread_usd", "min_credit"}
+    _int = {"target_dte", "dte_min", "dte_max", "dte_close", "max_concurrent",
+            "daily_entry_start_utc", "daily_entry_end_utc"}
+    applied = {}
+    for k, v in body.items():
+        if k in _float and v is not None:
+            setattr(eng, k, float(v)); applied[k] = float(v)
+        elif k in _int:
+            setattr(eng, k, int(v) if v is not None else None); applied[k] = getattr(eng, k)
+        elif k == "use_scanner":
+            eng.use_scanner = bool(v); applied[k] = eng.use_scanner
+    eng.save_state()
+    return {"applied": applied}
+
+
+@app.post("/spreads/live")
+async def spreads_live(body: dict):
+    eng = _spreads["engine"]
+    if eng is None:
+        raise HTTPException(503, "Spread engine not initialized")
+    res = eng.set_live_trading(bool(body.get("live")))
+    if not res.get("ok"):
+        raise HTTPException(400, res.get("error", "live switch refused"))
+    out = {"live_trading": eng.live_trading}
+    if eng.live_trading and eng._alpaca_live is not None:
+        h = await __import__("asyncio").to_thread(eng._alpaca_live.account_health)
+        out["live_equity"] = h.get("equity")
+    return out
+
+
+@app.get("/spreads/trades")
+async def spreads_trades(limit: int = 50):
+    eng = _spreads["engine"]
+    if eng is None:
+        return {"trades": []}
+    return {"trades": eng.recent_trades(limit)}
+
+
+@app.get("/scanner/status")
+async def scanner_status():
+    sc = _scanner["scanner"]
+    if sc is None:
+        return {"available": False}
+    out = sc.results()
+    out["available"] = True
+    return out
+
+
+@app.post("/scanner/scan")
+async def scanner_scan():
+    """Force an immediate rescan (don't wait for the 10m loop)."""
+    sc = _scanner["scanner"]
+    if sc is None:
+        raise HTTPException(503, "Scanner not initialized")
+    res = await __import__("asyncio").to_thread(sc.scan_once)
+    return {"scanned": len(res), "top_tradeable": [r for r in res if r.get("tradeable")][:5]}
 
 
 @app.get("/")
