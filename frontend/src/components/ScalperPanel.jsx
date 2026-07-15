@@ -249,22 +249,24 @@ export default function ScalperPanel({ apiBaseUrl }) {
                 {st.ai_reason && <span> — {st.ai_reason}</span>}
               </div>
             )}
-            <div className="grid grid-cols-2 gap-3">
-              <Stepper label="Fast EMA" val={st.ma_fast} min={3} max={st.ma_slow - 1} step={1}
-                       onSet={(v) => post('/scalper/config', { ma_fast: v })} />
-              <Stepper label="Slow EMA" val={st.ma_slow} min={st.ma_fast + 1} max={60} step={1}
-                       onSet={(v) => post('/scalper/config', { ma_slow: v })} />
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Stepper label="Timeframe (s)" val={st.ma_tf_seconds} min={15} max={120} step={15}
-                       onSet={(v) => post('/scalper/config', { ma_tf_seconds: v })} />
-              <Stepper label="Min sep %" val={st.ma_min_separation_pct} min={0} max={0.10} step={0.005} dp={3}
-                       onSet={(v) => post('/scalper/config', { ma_min_separation_pct: v })} />
-            </div>
-            <div className="text-[11px] text-text-secondary">
-              Lower fast vs slow = more crosses / faster (more whipsaw). Wider gap = fewer, cleaner signals.
-              Fast {st.ma_fast} must stay below Slow {st.ma_slow}.
-            </div>
+            <Collapsible title="Trading parameters" subtitle={`${st.ma_fast}/${st.ma_slow} EMA · ${st.ma_tf_seconds}s · sep ${st.ma_min_separation_pct}%`}>
+              <div className="grid grid-cols-2 gap-3">
+                <Stepper label="Fast EMA" val={st.ma_fast} min={3} max={st.ma_slow - 1} step={1}
+                         onSet={(v) => post('/scalper/config', { ma_fast: v })} />
+                <Stepper label="Slow EMA" val={st.ma_slow} min={st.ma_fast + 1} max={60} step={1}
+                         onSet={(v) => post('/scalper/config', { ma_slow: v })} />
+              </div>
+              <div className="grid grid-cols-2 gap-3 mt-3">
+                <Stepper label="Timeframe (s)" val={st.ma_tf_seconds} min={15} max={120} step={15}
+                         onSet={(v) => post('/scalper/config', { ma_tf_seconds: v })} />
+                <Stepper label="Min sep %" val={st.ma_min_separation_pct} min={0} max={0.10} step={0.005} dp={3}
+                         onSet={(v) => post('/scalper/config', { ma_min_separation_pct: v })} />
+              </div>
+              <div className="text-[11px] text-text-secondary mt-2">
+                Lower fast vs slow = more crosses / faster (more whipsaw). Wider gap = fewer, cleaner signals.
+                Fast {st.ma_fast} must stay below Slow {st.ma_slow}.
+              </div>
+            </Collapsible>
           </div>
         )}
         {st.signal_mode === 'ai' && (
@@ -274,11 +276,15 @@ export default function ScalperPanel({ apiBaseUrl }) {
               {st.ai_reason && <span className="text-text-secondary"> — {st.ai_reason}</span>}
               {st.ai_error && <span className="text-red-400"> · error: {st.ai_error}</span>}
             </div>
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <Cadence label="Mode-check every" valSec={st.ai_supervisor_seconds}
-                       opts={[60, 120, 180, 300, 600, 900]} onPick={(v) => post('/scalper/config', { ai_supervisor_seconds: v })} />
-              <Cadence label="Deep tune every" valSec={st.ai_tune_seconds}
-                       opts={[180, 300, 600, 900]} onPick={(v) => post('/scalper/config', { ai_tune_seconds: v })} />
+            <div className="mt-3">
+              <Collapsible title="AI cadence" subtitle={`check ${st.ai_supervisor_seconds}s · tune ${st.ai_tune_seconds}s`}>
+                <div className="grid grid-cols-2 gap-3">
+                  <Cadence label="Mode-check every" valSec={st.ai_supervisor_seconds}
+                           opts={[60, 120, 180, 300, 600, 900]} onPick={(v) => post('/scalper/config', { ai_supervisor_seconds: v })} />
+                  <Cadence label="Deep tune every" valSec={st.ai_tune_seconds}
+                           opts={[180, 300, 600, 900]} onPick={(v) => post('/scalper/config', { ai_tune_seconds: v })} />
+                </div>
+              </Collapsible>
             </div>
           </>
         )}
@@ -293,9 +299,8 @@ export default function ScalperPanel({ apiBaseUrl }) {
         <Stat label="Open" val={st.open_scalps ?? 0} />
       </div>
 
-      {/* risk & timing settings (operator-only) */}
-      <div className="glass p-4 rounded-xl">
-        <div className="text-xs text-text-secondary mb-2">Risk &amp; timing</div>
+      {/* risk & timing settings (operator-only) — collapsible */}
+      <Collapsible title="Risk & timing" subtitle={`kill $${st.daily_loss_kill_usd} · wait ${st.open_blackout_minutes}m`}>
         <div className="grid grid-cols-2 gap-3">
           <Stepper label="Kill switch $" val={st.daily_loss_kill_usd} min={10} max={2000} step={10}
                    onSet={(v) => post('/scalper/config', { daily_loss_kill_usd: v })} />
@@ -306,7 +311,7 @@ export default function ScalperPanel({ apiBaseUrl }) {
           Kill switch halts new entries once the day is down this much (from the current baseline).
           Wait-after-open sits out the first N min after 9:30 ET — the opening whipsaw — before scalping (0 = trade from the bell).
         </div>
-      </div>
+      </Collapsible>
 
       {/* live signals */}
       <div className="glass p-4 rounded-xl">
@@ -455,6 +460,28 @@ const Stat = ({ label, val, color }) => (
     <div className={`text-lg font-bold ${color || 'text-gray-100'}`}>{val}</div>
   </div>
 );
+
+// Collapsible pane — tucks parameter groups (risk / timing / trading knobs) away
+// so the cockpit (chart, ladder, positions, confirm) stays front-and-center.
+// Defaults collapsed; state is local (resets on reload, which is fine for knobs).
+function Collapsible({ title, subtitle, defaultOpen = false, children }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="glass rounded-xl overflow-hidden">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center justify-between px-4 py-2.5 text-left hover:bg-white/5 transition-colors"
+      >
+        <span className="flex items-center gap-2">
+          <span className="text-xs font-medium text-gray-200">{title}</span>
+          {subtitle && <span className="text-[10px] text-text-secondary">{subtitle}</span>}
+        </span>
+        <span className={`text-text-secondary text-xs transition-transform ${open ? 'rotate-90' : ''}`}>▶</span>
+      </button>
+      {open && <div className="px-4 pb-4 pt-1 border-t border-gray-700/40">{children}</div>}
+    </div>
+  );
+}
 
 // info icon with a hover/tap tooltip — explains each mode/strategy
 function InfoDot({ text, dark = false }) {
