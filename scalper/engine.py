@@ -98,6 +98,15 @@ _TUNE_INT_KEYS = ("time_stop_seconds", "regime_sample_seconds", "er_window",
                   "ma_fast", "ma_slow", "ma_tf_seconds", "ma_fast_exit_min_hold_s",
                   "ma_min_hold_before_crossback_s", "ma_trend_bias_bars",
                   "ma_fast_ai", "ma_slow_ai", "ma_time_stop_backstop_s", "apex_trend_bars")
+
+# Exit-reason classification for user-confirmation mode. RISK exits protect
+# capital/gains and ALWAYS fire automatically, even when autonomous is off — a
+# stop you might miss is a bigger loss. Only discretionary SIGNAL exits (a
+# reversal signal where the user might reasonably choose to hold) are gated.
+_RISK_EXIT_REASONS = frozenset({
+    "stop", "time_stop", "peak_lock", "trail", "kill", "profit_lock",
+    "kill_switch", "profit_lock_giveback",
+})
 _DSL_OPS = {">", "<", ">=", "<=", "between", "==", "and", "or", "not"}
 _DSL_ACTIONS = {"call", "put", "with_momentum", "fade", "skip"}
 _DSL_SIGNALS = {
@@ -150,6 +159,16 @@ class ScalperEngine:
         # tunables (defaults mirror platform)
         self.signal_mode = "ai"           # momentum | fade | auto | ai | macross
         self.enabled = False
+        # Autonomous vs. user-confirmed trading. When True (default), signals
+        # execute immediately (the classic behavior). When False, entry signals
+        # and DISCRETIONARY (signal-driven) exits are parked as pending signals
+        # for the user to confirm within a short window; RISK exits (stop /
+        # time-stop / peak-lock / trail / kill / profit-lock) ALWAYS fire
+        # automatically regardless — capital protection is never gated on a tap.
+        self.autonomous = True
+        self._pending: Dict[str, dict] = {}   # signal_id -> pending signal
+        self._pending_seq = 0
+        self.confirm_window_s = 8             # a pending signal expires after this
         # MA-crossover (high-frequency) params — the 'macross' mode.
         self.ma_fast = 8
         self.ma_slow = 21
@@ -1396,6 +1415,7 @@ class ScalperEngine:
                         pass
                 self._maybe_roll_day()
                 self._ingest_prices()
+                self._expire_pending()   # drop stale unconfirmed signals
                 if self.enabled:
                     # ALWAYS manage open positions — even when halted (kill switch /
                     # profit lock). Halting must stop NEW ENTRIES, never abandon an
@@ -1443,6 +1463,23 @@ class ScalperEngine:
                 and not self._profit_lock_tripped):
             self._profit_lock_tripped = True
             logger.warning("PROFIT LOCK tripped — peak $%.0f now $%.0f", self._daily_peak_pnl, self._daily_realized_pnl)
+
+    async def _do_exit(self, scalp, mid, pnl_pct, reason) -> None:
+        """Route an exit through the confirmation gate. RISK exits (stop, time-stop,
+        peak-lock, trail, kill, profit-lock) ALWAYS close immediately, even when
+        autonomous is off — capital/gains protection is never gated. Discretionary
+        SIGNAL exits (cross_back, fast_exit, profit_target) are parked for user
+        confirmation when autonomous is off; otherwise they close immediately."""
+        if self.autonomous or reason in _RISK_EXIT_REASONS:
+            await self._close_scalp(scalp, mid, pnl_pct, reason)
+            return
+        # user-confirm mode + a discretionary signal exit → park it
+        self._park_pending({
+            "kind": "exit", "scalp_key": scalp.key, "occ": scalp.occ,
+            "symbol": scalp.underlying, "direction": scalp.direction,
+            "qty": scalp.qty, "reason": reason,
+            "pnl_pct": round(pnl_pct * 100, 1) if pnl_pct is not None else None,
+        })
 
     # ── exits (port) ───────────────────────────────────────────────────────
     async def _manage_open_scalps(self):
@@ -1500,7 +1537,7 @@ class ScalperEngine:
                 elif pnl_pct <= -self.ma_stop_pct_backstop:
                     reason = "stop"                 # option-% catastrophe backstop
                 if reason:
-                    await self._close_scalp(scalp, mid_f, pnl_pct, reason)
+                    await self._do_exit(scalp, mid_f, pnl_pct, reason)
                 continue
             if scalp.strategy in ("macross_x", "ai", "apex") and mid and scalp.entry_mid > 0:
                 # High-frequency MA exit: TIGHT target, but let runners ride a trail
@@ -1643,7 +1680,7 @@ class ScalperEngine:
             elif held >= eff_time:
                 reason = "time_stop"
             if reason:
-                await self._close_scalp(scalp, float(mid) if mid else None, pnl_pct, reason)
+                await self._do_exit(scalp, float(mid) if mid else None, pnl_pct, reason)
 
     async def _close_scalp(self, scalp, exit_mid, pnl_pct, reason):
         await asyncio.to_thread(self.alpaca.sell_to_close, scalp.occ, scalp.qty,
@@ -1881,6 +1918,29 @@ class ScalperEngine:
         qty = int(self.per_trade_usd // (ask * 100.0))
         if qty < 1:
             return
+
+        # USER-CONFIRM GATE: when autonomous is off, park the resolved entry as a
+        # pending signal (with the real strike/price/qty) for the user to confirm,
+        # instead of firing. The entry stops/sizing stay fixed by config — only
+        # the go/no-go decision is handed to the user. Autonomous → execute now.
+        if not self.autonomous:
+            self._park_pending({
+                "kind": "entry", "strategy": strategy, "symbol": sym,
+                "direction": direction, "occ": occ,
+                "strike": contract.get("strike"), "qty": qty, "price": round(ask, 2),
+                "score": round(score, 3) if score is not None else None,
+                "reason": "entry_signal",
+            })
+            return
+
+        await self._execute_entry(sym, direction, occ, ask, qty, score, strategy,
+                                  contract.get("strike"))
+
+    async def _execute_entry(self, sym, direction, occ, ask, qty, score, strategy,
+                             strike=None):
+        """Place the entry order + register the open scalp. Shared by the
+        autonomous path and the user-confirm path."""
+        underlying_px = self._latest_price(sym)
         order = await asyncio.to_thread(self.alpaca.buy_to_open, occ, qty, ask)
         if not order:
             return
@@ -1897,6 +1957,100 @@ class ScalperEngine:
         self._entries_today += 1
         self._last_entry_at = datetime.utcnow()
         logger.info("ENTRY [%s] %s %s x%d @ %.2f", strategy, direction, occ, qty, entry)
+
+    # ── user-confirmation machinery ─────────────────────────────────────────
+    def _park_pending(self, sig: dict) -> str:
+        """Register a pending signal awaiting user confirmation. Coalesces on
+        (kind, occ/symbol) so a repeated tick doesn't stack duplicates; sets an
+        expiry after which the loop drops it (a stale scalp signal must not fill
+        late). Returns the signal id."""
+        now = datetime.utcnow()
+        # de-dup: replace an existing same-target pending rather than pile up.
+        dedup_key = (sig.get("kind"), sig.get("occ") or sig.get("symbol"))
+        for sid, ex in list(self._pending.items()):
+            if (ex.get("kind"), ex.get("occ") or ex.get("symbol")) == dedup_key:
+                del self._pending[sid]
+        self._pending_seq += 1
+        sid = f"sig{self._pending_seq}"
+        sig = dict(sig)
+        sig["id"] = sid
+        sig["created_ts"] = int(now.timestamp())
+        sig["expires_ts"] = int(now.timestamp()) + self.confirm_window_s
+        self._pending[sid] = sig
+        logger.info("PENDING %s %s %s (awaiting confirm, %ss)",
+                    sig.get("kind"), sig.get("direction") or "", sig.get("occ") or sig.get("symbol"),
+                    self.confirm_window_s)
+        return sid
+
+    def _expire_pending(self) -> None:
+        """Drop pending signals past their window. Called each tick."""
+        nowt = int(datetime.utcnow().timestamp())
+        for sid, ex in list(self._pending.items()):
+            if nowt >= ex.get("expires_ts", 0):
+                logger.info("PENDING %s expired (unconfirmed)", sid)
+                del self._pending[sid]
+
+    def pending_signals(self) -> list:
+        """Live pending signals for the UI (soonest-expiring first)."""
+        nowt = int(datetime.utcnow().timestamp())
+        out = []
+        for ex in self._pending.values():
+            e = dict(ex)
+            e["seconds_left"] = max(0, e.get("expires_ts", nowt) - nowt)
+            out.append(e)
+        return sorted(out, key=lambda e: e["seconds_left"])
+
+    async def confirm_signal(self, signal_id: str, action: str = "confirm") -> dict:
+        """User confirms/skips a pending signal. 'confirm' executes it now;
+        anything else drops it. Returns {ok, executed, reason}."""
+        sig = self._pending.pop(signal_id, None)
+        if sig is None:
+            return {"ok": False, "reason": "not_found_or_expired"}
+        if action != "confirm":
+            return {"ok": True, "executed": False, "reason": "skipped"}
+        if int(datetime.utcnow().timestamp()) >= sig.get("expires_ts", 0):
+            return {"ok": False, "reason": "expired"}
+        try:
+            if sig["kind"] == "entry":
+                await self._execute_entry(
+                    sig["symbol"], sig["direction"], sig["occ"], sig["price"],
+                    sig["qty"], sig.get("score"), sig.get("strategy", "macross3"),
+                    sig.get("strike"))
+                return {"ok": True, "executed": True, "kind": "entry"}
+            if sig["kind"] == "exit":
+                scalp = self._open.get(sig["scalp_key"])
+                if scalp is None:
+                    return {"ok": False, "reason": "position_gone"}
+                snap = await self._option_quote(scalp.occ)
+                mid = snap.get("mid_price") or snap.get("bid")
+                pnl_pct = ((float(mid) - scalp.entry_mid) / scalp.entry_mid) if (mid and scalp.entry_mid) else 0.0
+                await self._close_scalp(scalp, float(mid) if mid else None, pnl_pct,
+                                        sig.get("reason", "user_exit"))
+                return {"ok": True, "executed": True, "kind": "exit"}
+        except Exception as e:
+            logger.warning("confirm_signal %s failed: %s", signal_id, e)
+            return {"ok": False, "reason": str(e)}
+        return {"ok": False, "reason": "unknown_kind"}
+
+    async def manual_close(self, scalp_key: str) -> dict:
+        """User closes an open position immediately (the Close Now button)."""
+        scalp = self._open.get(scalp_key)
+        if scalp is None:
+            # tolerate passing a bare OCC
+            scalp = next((s for s in self._open.values() if s.occ == scalp_key), None)
+        if scalp is None:
+            return {"ok": False, "reason": "not_open"}
+        snap = await self._option_quote(scalp.occ)
+        mid = snap.get("mid_price") or snap.get("bid")
+        pnl_pct = ((float(mid) - scalp.entry_mid) / scalp.entry_mid) if (mid and scalp.entry_mid) else 0.0
+        await self._close_scalp(scalp, float(mid) if mid else None, pnl_pct, "manual")
+        return {"ok": True, "executed": True}
+
+    def set_autonomous(self, on: bool) -> None:
+        self.autonomous = bool(on)
+        if self.autonomous:
+            self._pending.clear()   # switching to auto clears any parked prompts
+        logger.info("Scalper autonomous=%s", self.autonomous)
 
     def _signal_snapshot(self, sym, score=None) -> Dict[str, Any]:
         """Full signal context for a symbol — captured at entry/exit so each trade
@@ -2085,6 +2239,9 @@ class ScalperEngine:
         entry_state, entry_reason = self._entry_state()
         return {
             "enabled": self.enabled, "running": self._running, "signal_mode": self.signal_mode,
+            "autonomous": self.autonomous,
+            "confirm_window_s": self.confirm_window_s,
+            "pending_signals": self.pending_signals(),
             "entry_state": entry_state, "entry_reason": entry_reason,
             "live_trading": self.live_trading,
             "live_available": self._alpaca_live is not None,

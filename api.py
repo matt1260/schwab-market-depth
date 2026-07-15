@@ -170,6 +170,41 @@ async def scalper_toggle(body: dict):
     return {"enabled": eng.enabled}
 
 
+@app.post("/scalper/autonomous")
+async def scalper_autonomous(body: dict):
+    """Toggle autonomous vs user-confirmed trading. When off, entry signals and
+    discretionary exits are parked for confirmation (risk stops still auto-fire)."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    eng.set_autonomous(bool(body.get("autonomous")))
+    return {"autonomous": eng.autonomous}
+
+
+@app.post("/scalper/confirm")
+async def scalper_confirm(body: dict):
+    """Confirm or skip a pending signal. body: {signal_id, action: confirm|skip}."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    sid = body.get("signal_id")
+    if not sid:
+        raise HTTPException(400, "signal_id required")
+    return await eng.confirm_signal(sid, body.get("action", "confirm"))
+
+
+@app.post("/scalper/close")
+async def scalper_close(body: dict):
+    """Manually close an open position now. body: {scalp_key} (or bare OCC)."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    key = body.get("scalp_key") or body.get("occ")
+    if not key:
+        raise HTTPException(400, "scalp_key required")
+    return await eng.manual_close(key)
+
+
 @app.post("/scalper/live")
 async def scalper_live(body: dict):
     """Switch execution between PAPER and LIVE (real money). Guarded: refuses LIVE

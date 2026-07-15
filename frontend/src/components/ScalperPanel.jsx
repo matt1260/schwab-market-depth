@@ -1,6 +1,7 @@
 // Standalone scalper control panel — status, mode, toggle, live signals, AI feed.
 import { useState, useEffect, useCallback } from 'react';
 import CandleChart from './CandleChart';
+import ConfirmCard from './ConfirmCard';
 
 export default function ScalperPanel({ apiBaseUrl }) {
   const [st, setSt] = useState(null);
@@ -131,6 +132,17 @@ export default function ScalperPanel({ apiBaseUrl }) {
             {st.live_trading ? 'LIVE ✓ (click for paper)' : st.live_available ? 'Go LIVE 💵' : 'LIVE (no keys)'}
           </button>
           <button
+            onClick={() => post('/scalper/autonomous', { autonomous: !st.autonomous })}
+            title={st.autonomous
+              ? 'Autonomous: signals fire automatically. Click to require confirmation.'
+              : 'Confirm mode: you approve each entry/exit signal (risk stops still auto-fire). Click for autonomous.'}
+            className={`px-3 py-1.5 rounded text-xs font-bold transition-colors ${
+              st.autonomous ? 'bg-indigo-500 text-black hover:bg-indigo-400' : 'bg-amber-500 text-black hover:bg-amber-400'
+            }`}
+          >
+            {st.autonomous ? '🤖 Autonomous' : '🙋 Confirm mode'}
+          </button>
+          <button
             onClick={() => post('/scalper/toggle', { enabled: !st.enabled })}
             className={`px-4 py-1.5 rounded font-bold ${st.enabled ? 'bg-green-500 text-black' : 'bg-gray-600 text-white'}`}
           >
@@ -138,6 +150,15 @@ export default function ScalperPanel({ apiBaseUrl }) {
           </button>
         </div>
       </div>
+
+      {/* Pending-signal confirmation cards (only appear in Confirm mode) */}
+      {!st.autonomous && (
+        <ConfirmCard
+          apiBaseUrl={apiBaseUrl}
+          confirmWindowS={st.confirm_window_s || 8}
+          onAction={refresh}
+        />
+      )}
 
       {(st.kill_switch_tripped || st.profit_lock_tripped) && (
         <div className="glass p-3 rounded-lg text-sm text-amber-300">
