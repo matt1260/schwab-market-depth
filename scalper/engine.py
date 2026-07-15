@@ -89,15 +89,19 @@ _TUNE_SAFE_BANDS: Dict[str, Tuple[float, float]] = {
     "ma_time_stop_backstop_s": (300, 3600),  # FAR time backstop for a never-invalidated flat trade
     "ma_min_hold_before_crossback_s": (0, 60),  # ignore cross_back within this many s of entry
     "ma_trend_bias_bars": (2, 12),           # slow-EMA slope window for the trend bias
+    "ma_failed_reversal_grace_s": (10, 180),        # how long the reversal has to start working
+    "ma_failed_reversal_min_pnl_pct": (-0.40, -0.02),  # option P&L worse than this at deadline = cut
 }
 _TUNE_BOOL_KEYS = ("chop_guard_enabled", "velocity_gate_enabled", "ma_fast_exit_enabled",
                    "ma_book_gate_enabled", "ma_book_invert",
                    "ma_wall_gate_enabled", "ma_wall_bounce_signal", "ma_require_confirm",
-                   "ma_trend_bias_enabled", "ma_tri_require_l2")
+                   "ma_trend_bias_enabled", "ma_tri_require_l2",
+                   "ma_failed_reversal_enabled", "ma_failed_reversal_needs_progress")
 _TUNE_INT_KEYS = ("time_stop_seconds", "regime_sample_seconds", "er_window",
                   "ma_fast", "ma_slow", "ma_tf_seconds", "ma_fast_exit_min_hold_s",
                   "ma_min_hold_before_crossback_s", "ma_trend_bias_bars",
-                  "ma_fast_ai", "ma_slow_ai", "ma_time_stop_backstop_s", "apex_trend_bars")
+                  "ma_fast_ai", "ma_slow_ai", "ma_time_stop_backstop_s", "apex_trend_bars",
+                  "ma_failed_reversal_grace_s")
 
 # Exit-reason classification for user-confirmation mode. RISK exits protect
 # capital/gains and ALWAYS fire automatically, even when autonomous is off — a
@@ -106,6 +110,7 @@ _TUNE_INT_KEYS = ("time_stop_seconds", "regime_sample_seconds", "er_window",
 _RISK_EXIT_REASONS = frozenset({
     "stop", "time_stop", "peak_lock", "trail", "kill", "profit_lock",
     "kill_switch", "profit_lock_giveback",
+    "reversal_stop", "failed_reversal",   # thesis-invalidation cuts — protect capital
 })
 _DSL_OPS = {">", "<", ">=", "<=", "between", "==", "and", "or", "not"}
 _DSL_ACTIONS = {"call", "put", "with_momentum", "fade", "skip"}
@@ -209,6 +214,24 @@ class ScalperEngine:
         self.ma_min_hold_before_crossback_s = 15  # ignore a regime flip within this many
                                           # seconds of entry (EMA flicker at the cross, not
                                           # a real reversal) — the underlying stop caps risk
+        # FAILED-REVERSAL EARLY EXIT (operator model): an entry is a bet on an
+        # IMMEDIATE change of direction. A good reversal signal works FAST — if
+        # the move hasn't gone our way shortly after entry, the direction-change
+        # didn't happen and the signal was wrong. Cut it SMALL rather than ride a
+        # bleeder to the wide catastrophe stop (the QQQ 719C that leaked -16% over
+        # 321s waiting on a lagging EMA break). At the grace deadline: if the trade
+        # is worse than a small tolerance AND the underlying hasn't progressed in
+        # our favor, exit "failed_reversal". Distinct from the min-hold flicker
+        # guard: this fires ONCE, at the deadline, on a trade that never started
+        # working — not on transient noise.
+        self.ma_failed_reversal_enabled = True
+        self.ma_failed_reversal_grace_s = 45   # give the reversal this long to start
+        self.ma_failed_reversal_min_pnl_pct = -0.10  # if option P&L is worse than this at
+                                          # the deadline (and underlying hasn't progressed),
+                                          # the reversal failed → cut it (-10% option)
+        self.ma_failed_reversal_needs_progress = True  # also require the UNDERLYING to have
+                                          # moved in our favor vs entry; if it hasn't by the
+                                          # deadline, the direction-change clearly didn't happen
         # HIGHER-TF TREND BIAS: only trade WITH the slow-EMA-slope trend (ignore the
         # counter-trend 8/21 flickers on intra-trend bounces → ride the dominant move).
         self.ma_trend_bias_enabled = True
@@ -566,7 +589,9 @@ class ScalperEngine:
                    "ma_wall_gate_enabled", "ma_wall_near_pct", "ma_wall_bounce_signal",
                    "ma_require_confirm", "ma_book_confirm_min",
                    "ma_underlying_stop_pct", "ma_stop_pct_backstop", "ma_time_stop_backstop_s",
-                   "ma_min_hold_before_crossback_s", "ma_trend_bias_enabled", "ma_trend_bias_bars")
+                   "ma_min_hold_before_crossback_s", "ma_trend_bias_enabled", "ma_trend_bias_bars",
+                   "ma_failed_reversal_enabled", "ma_failed_reversal_grace_s",
+                   "ma_failed_reversal_min_pnl_pct", "ma_failed_reversal_needs_progress")
 
     def _state_path(self):
         return os.path.join(os.path.dirname(DB_PATH), "scalper_state.json")
@@ -1611,9 +1636,23 @@ class ScalperEngine:
                 peak_pct = (scalp.peak_mid - scalp.entry_mid) / scalp.entry_mid
                 # PEAK-GIVEBACK LOCK (V-reversal fix) — checked FIRST so a sharp reversal
                 # locks the run before the lagging 9×21 cross confirms.
+                # FAILED-REVERSAL early cut (same operator model as macross_x): a
+                # reversal entry that never started working in the grace window is a
+                # dead signal — cut it small instead of riding to the EMA-50 break.
+                armed3 = peak_pct >= self.ma_peak_lock_arm_pct
+                progress3 = 0.0
+                if scalp.entry_underlying and u_px:
+                    progress3 = ((u_px - scalp.entry_underlying) / scalp.entry_underlying if scalp.direction == "call"
+                                 else (scalp.entry_underlying - u_px) / scalp.entry_underlying) * 100.0
+                failed3 = (self.ma_failed_reversal_enabled and not armed3
+                           and held >= self.ma_failed_reversal_grace_s
+                           and pnl_pct <= self.ma_failed_reversal_min_pnl_pct
+                           and ((not self.ma_failed_reversal_needs_progress) or progress3 <= 0))
                 if (peak_pct >= self.ma_peak_lock_arm_pct
                         and pnl_pct <= peak_pct * (1 - self.ma_peak_giveback_frac)):
                     reason = "peak_lock"
+                elif failed3:
+                    reason = "failed_reversal"       # never started working in the grace window
                 elif tri is not None and tri.exit_signal(scalp.direction):
                     reason = "cross_back"          # opposite 9×21 cross — the primary exit
                 elif ema50_stop_hit:
@@ -1694,13 +1733,28 @@ class ScalperEngine:
                 # — that whipsawed right-direction puts as QQQ kept dropping 725→718. Stop
                 # only if the underlying moves against by >= ma_underlying_stop_pct.
                 u_stop_hit = False
+                underlying_progress = 0.0   # % the underlying has moved IN OUR FAVOR vs entry
                 if scalp.entry_underlying and u_px:
                     adverse = ((scalp.entry_underlying - u_px) / scalp.entry_underlying if scalp.direction == "call"
                                else (u_px - scalp.entry_underlying) / scalp.entry_underlying) * 100.0
+                    underlying_progress = -adverse   # positive = moved our way
                     if adverse >= self.ma_underlying_stop_pct:
                         u_stop_hit = True
+                # FAILED-REVERSAL EARLY EXIT: at the grace deadline, if the trade never
+                # started working (option P&L still worse than tolerance AND — if required —
+                # the underlying hasn't progressed in our favor), the direction-change the
+                # signal predicted didn't happen → cut it small. Only for trades that never
+                # became runners (an armed runner is working by definition).
+                failed_reversal = False
+                if (self.ma_failed_reversal_enabled and not armed
+                        and held >= self.ma_failed_reversal_grace_s
+                        and pnl_pct <= self.ma_failed_reversal_min_pnl_pct):
+                    if (not self.ma_failed_reversal_needs_progress) or underlying_progress <= 0:
+                        failed_reversal = True
                 if hard_stop_hit:
                     reason = "reversal_stop"         # broke the reversal candle → thesis dead
+                elif failed_reversal:
+                    reason = "failed_reversal"       # never started working in the grace window
                 elif (regime is not None and regime != scalp.direction
                       and held >= self.ma_min_hold_before_crossback_s):
                     # MIN-HOLD before cross_back: a regime flip within a few seconds of
