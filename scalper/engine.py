@@ -169,6 +169,12 @@ class ScalperEngine:
         self._pending: Dict[str, dict] = {}   # signal_id -> pending signal
         self._pending_seq = 0
         self.confirm_window_s = 8             # a pending signal expires after this
+        # Options ladder: the ATM±2 strikes the engine is currently eyeing per
+        # symbol (side chosen by the EMA regime), refreshed periodically off the
+        # hot path so status() stays cheap. {sym: {side, strikes:[{strike,occ,mid,...}]}}
+        self._ladder: Dict[str, dict] = {}
+        self._ladder_at: Optional[datetime] = None
+        self._position_cache: list = []       # enriched open positions (loop-refreshed)
         # MA-crossover (high-frequency) params — the 'macross' mode.
         self.ma_fast = 8
         self.ma_slow = 21
@@ -878,6 +884,78 @@ class ScalperEngine:
                 return q
         return await asyncio.to_thread(self.alpaca.option_quote, occ)
 
+    async def _refresh_ladder(self):
+        """Build the ATM±2 options ladder per symbol for the side the engine is
+        currently leaning (EMA 21×50 regime). Runs off the hot path (~every 6s);
+        the UI reads the cached result from status(). Best-effort — a failure just
+        leaves the prior ladder in place."""
+        now = datetime.utcnow()
+        if self._ladder_at and (now - self._ladder_at).total_seconds() < 6:
+            return
+        self._ladder_at = now
+        for sym in self.symbols:
+            try:
+                spot = self._latest_price(sym)
+                if not spot:
+                    continue
+                tri = self._ema_tri.get(sym)
+                side = (tri.regime_2150() if tri else None) or "call"
+                contracts = await asyncio.to_thread(
+                    self.alpaca.find_contracts, sym, side, self.max_dte, spot)
+                if not contracts:
+                    continue
+                # 5 strikes centered on the money (ATM ±2)
+                contracts.sort(key=lambda c: abs(c["strike"] - spot))
+                near = sorted(contracts[:5], key=lambda c: c["strike"])
+                rows = []
+                for c in near:
+                    q = await self._option_quote(c["symbol"])
+                    mid = q.get("mid_price") or q.get("mid") or q.get("ask")
+                    per = self.per_trade_usd
+                    qty = int(per // (float(mid) * 100.0)) if mid else 0
+                    rows.append({
+                        "strike": c["strike"], "occ": c["symbol"],
+                        "mid": round(float(mid), 2) if mid else None,
+                        "bid": round(float(q.get("bid")), 2) if q.get("bid") else None,
+                        "ask": round(float(q.get("ask")), 2) if q.get("ask") else None,
+                        "qty": qty,
+                        "atm": abs(c["strike"] - spot) == min(abs(x["strike"] - spot) for x in near),
+                    })
+                self._ladder[sym] = {"side": side, "spot": round(spot, 2), "strikes": rows}
+            except Exception as e:
+                logger.debug("ladder %s failed: %s", sym, e)
+
+    async def _position_view(self) -> list:
+        """Enriched open positions for the UI: live mid, P&L $/%, peak %, and the
+        active stop/target so the panel shows a real-time performance indicator."""
+        out = []
+        for sc in self._open.values():
+            try:
+                q = await self._option_quote(sc.occ)
+                mid = q.get("mid_price") or q.get("bid")
+                mid_f = float(mid) if mid else None
+                pnl_pct = ((mid_f - sc.entry_mid) / sc.entry_mid * 100.0) if (mid_f and sc.entry_mid) else None
+                pnl_usd = ((mid_f - sc.entry_mid) * sc.qty * 100.0) if (mid_f and sc.entry_mid) else None
+                peak_pct = ((sc.peak_mid - sc.entry_mid) / sc.entry_mid * 100.0) if sc.entry_mid else None
+            except Exception:
+                mid_f = pnl_pct = pnl_usd = peak_pct = None
+            out.append({
+                "occ": sc.occ, "scalp_key": sc.key, "underlying": sc.underlying,
+                "direction": sc.direction, "qty": sc.qty,
+                "entry_mid": round(sc.entry_mid, 2),
+                "mid": round(mid_f, 2) if mid_f else None,
+                "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else None,
+                "pnl_usd": round(pnl_usd, 0) if pnl_usd is not None else None,
+                "peak_pct": round(peak_pct, 1) if peak_pct is not None else None,
+                "strategy": getattr(sc, "strategy", None),
+                "held_s": round((datetime.utcnow() - sc.opened_at).total_seconds(), 0),
+                # config-fixed risk levels shown for context (the stop is engine-managed)
+                "stop_pct": round(self.ma_stop_pct_backstop * 100, 0) if sc.strategy == "macross3" else round(self.ma_stop_pct * 100, 0),
+                "ema50_stop_armed": getattr(sc, "ema50_stop_armed", False),
+            })
+        self._position_cache = out
+        return out
+
     # ── indicator wrappers (bind engine state to pure indicators) ──────────
     def _latest_price(self, sym):
         w = self._prices.get(sym)
@@ -1416,6 +1494,12 @@ class ScalperEngine:
                 self._maybe_roll_day()
                 self._ingest_prices()
                 self._expire_pending()   # drop stale unconfirmed signals
+                # UI data refreshed off the sync status() path (I/O-bound):
+                await self._refresh_ladder()       # ATM±2 strikes (cached ~6s)
+                if self._open:
+                    await self._position_view()    # live P&L per open position
+                else:
+                    self._position_cache = []
                 if self.enabled:
                     # ALWAYS manage open positions — even when halted (kill switch /
                     # profit lock). Halting must stop NEW ENTRIES, never abandon an
@@ -2254,15 +2338,18 @@ class ScalperEngine:
             "entries_today": self._entries_today, "exits_today": self._exits_today, "wins_today": self._wins_today,
             "win_rate": round(self._wins_today / self._exits_today, 2) if self._exits_today else None,
             "open_scalps": len(self._open),
-            "open_positions": [
+            # Enriched, loop-refreshed live positions (P&L $/%, peak, stop) — the
+            # UI's active performance indicator. Falls back to a bare view if the
+            # cache hasn't populated yet (first tick after an entry).
+            "open_positions": self._position_cache or [
                 {
-                    "occ": sc.occ, "underlying": sc.underlying, "direction": sc.direction,
-                    "qty": sc.qty, "entry_mid": round(sc.entry_mid, 2),
+                    "occ": sc.occ, "scalp_key": sc.key, "underlying": sc.underlying,
+                    "direction": sc.direction, "qty": sc.qty, "entry_mid": round(sc.entry_mid, 2),
                     "strategy": getattr(sc, "strategy", None),
                     "held_s": round((datetime.utcnow() - sc.opened_at).total_seconds(), 0),
-                    "entry_ctx": sc.entry_ctx,
                 } for sc in self._open.values()
             ],
+            "ladder": self._ladder,   # ATM±2 strikes the engine is eyeing per symbol
             "symbols": self.symbols,
             "per_trade_usd": self.per_trade_usd,
             "max_concurrent": self.max_concurrent,

@@ -2,6 +2,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import CandleChart from './CandleChart';
 import ConfirmCard from './ConfirmCard';
+import { PositionsPanel, OptionsLadder } from './PositionsPanel';
 
 export default function ScalperPanel({ apiBaseUrl }) {
   const [st, setSt] = useState(null);
@@ -165,6 +166,17 @@ export default function ScalperPanel({ apiBaseUrl }) {
           {st.kill_switch_tripped ? '⛔ Kill switch tripped — new entries halted.' : '🔒 Profit lock tripped — gains locked, entries halted.'}
         </div>
       )}
+
+      {/* live positions — active P&L + Close Now (only when holding) */}
+      {(st.open_positions?.length > 0) && (
+        <div>
+          <div className="text-xs text-text-secondary mb-1">Open positions</div>
+          <PositionsPanel apiBaseUrl={apiBaseUrl} positions={st.open_positions} onClose={refresh} />
+        </div>
+      )}
+
+      {/* options ladder — strikes the algo is currently selecting */}
+      <OptionsLadder ladder={st.ladder || {}} />
 
       {/* entry state — is it actually trading right now? */}
       <EntryStateBanner state={st.entry_state} reason={st.entry_reason}
