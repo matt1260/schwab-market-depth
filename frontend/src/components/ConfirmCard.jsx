@@ -60,16 +60,16 @@ export default function ConfirmCard({ apiBaseUrl, confirmWindowS = 8, onAction }
             {/* signal detail */}
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 text-sm font-bold">
-                <span className={isCall ? 'text-green-400' : 'text-red-400'}>
+                <span className={isCall ? 'text-up' : 'text-down'}>
                   {isEntry ? 'ENTER' : 'EXIT'} {sig.direction?.toUpperCase()}
                 </span>
-                <span className="text-gray-300">{sig.symbol}</span>
+                <span className="text-muted">{sig.symbol}</span>
                 {sig.strike != null && (
-                  <span className="text-gray-400 font-mono text-xs">${sig.strike} {isCall ? 'C' : 'P'}</span>
+                  <span className="text-muted font-mono text-xs">${sig.strike} {isCall ? 'C' : 'P'}</span>
                 )}
-                <span className="text-[10px] uppercase tracking-wide text-gray-500">{sig.strategy || sig.reason}</span>
+                <span className="text-[10px] uppercase tracking-wide text-faint">{sig.strategy || sig.reason}</span>
               </div>
-              <div className="text-xs text-gray-400 font-mono mt-0.5">
+              <div className="text-xs text-muted font-mono mt-0.5">
                 {isEntry
                   ? `${sig.qty} × @ $${sig.price?.toFixed?.(2) ?? sig.price}  (~$${(sig.qty * sig.price * 100).toFixed(0)})`
                   : `close ${sig.qty} ×  ${sig.pnl_pct != null ? `(${sig.pnl_pct > 0 ? '+' : ''}${sig.pnl_pct}%)` : ''}  · ${sig.reason}`}
@@ -79,11 +79,11 @@ export default function ConfirmCard({ apiBaseUrl, confirmWindowS = 8, onAction }
             <div className="flex items-center gap-2 shrink-0">
               <button
                 onClick={() => act(sig, 'skip')}
-                className="px-3 py-1.5 rounded text-xs font-medium bg-gray-700 text-gray-200 hover:bg-gray-600"
+                className="px-3 py-1.5 rounded text-xs font-medium bg-raised text-ink hover:bg-raised"
               >Skip</button>
               <button
                 onClick={() => act(sig, 'confirm')}
-                className={`px-4 py-1.5 rounded text-xs font-bold text-black ${isCall ? 'bg-green-500 hover:bg-green-400' : 'bg-red-500 hover:bg-red-400'}`}
+                className={`px-4 py-1.5 rounded text-xs font-bold text-black ${isCall ? 'bg-up hover:bg-green-400' : 'bg-down hover:bg-red-400'}`}
               >Confirm</button>
             </div>
           </div>
@@ -105,7 +105,7 @@ function CountdownRing({ pct, seconds, color }) {
           style={{ transition: 'stroke-dashoffset 1s linear' }}
         />
       </svg>
-      <div className="absolute inset-0 flex items-center justify-center text-xs font-mono font-bold text-gray-200">
+      <div className="absolute inset-0 flex items-center justify-center text-xs font-mono font-bold text-ink">
         {seconds}
       </div>
     </div>

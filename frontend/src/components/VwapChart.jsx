@@ -25,6 +25,9 @@ export default function VwapChart({ apiBaseUrl, symbol, height = 320 }) {
     series.current.mean = chart.current.addLineSeries({ color: '#f59e0b', lineWidth: 1, title: 'Mean (VWAP-ish)' });
     series.current.upper = chart.current.addLineSeries({ color: '#475569', lineWidth: 1, lineStyle: 2, title: '+2σ' });
     series.current.lower = chart.current.addLineSeries({ color: '#475569', lineWidth: 1, lineStyle: 2, title: '-2σ' });
+    // MA crossover lines (macross strategy): fast (cyan) vs slow (magenta)
+    series.current.emaFast = chart.current.addLineSeries({ color: '#22d3ee', lineWidth: 2, title: 'Fast EMA' });
+    series.current.emaSlow = chart.current.addLineSeries({ color: '#e879f9', lineWidth: 2, title: 'Slow EMA' });
     const resize = () => chart.current && el.current && chart.current.applyOptions({ width: el.current.clientWidth });
     const ro = new ResizeObserver(resize); ro.observe(el.current);
     return () => { ro.disconnect(); chart.current?.remove(); chart.current = null; series.current = {}; };
@@ -48,6 +51,8 @@ export default function VwapChart({ apiBaseUrl, symbol, height = 320 }) {
         series.current.mean.setData(clean.filter((p) => p.mean != null).map((p) => ({ time: p.t, value: p.mean })));
         series.current.upper.setData(clean.filter((p) => p.upper != null).map((p) => ({ time: p.t, value: p.upper })));
         series.current.lower.setData(clean.filter((p) => p.lower != null).map((p) => ({ time: p.t, value: p.lower })));
+        series.current.emaFast.setData(clean.filter((p) => p.ema_fast != null).map((p) => ({ time: p.t, value: p.ema_fast })));
+        series.current.emaSlow.setData(clean.filter((p) => p.ema_slow != null).map((p) => ({ time: p.t, value: p.ema_slow })));
 
         // entry/exit markers from trade history — ONLY within the chart's time
         // window, else lightweight-charts clamps off-window markers onto the last
@@ -88,13 +93,13 @@ export default function VwapChart({ apiBaseUrl, symbol, height = 320 }) {
     <div className="relative w-full">
       <div ref={el} className="w-full rounded border border-slate-800 bg-[#0a0e17]" style={{ height }}>
         {empty && (
-          <div className="absolute inset-0 flex items-center justify-center text-xs text-text-secondary">
+          <div className="absolute inset-0 flex items-center justify-center text-xs text-muted">
             Warming up {symbol} chart… (mean/bands appear after ~3 min of samples)
           </div>
         )}
       </div>
-      <div className="mt-1 text-[10px] text-text-secondary">
-        <span className="text-blue-400">━ price</span> · <span className="text-amber-500">━ session mean (VWAP-ish, volume-free)</span> · <span className="text-slate-400">┈ ±2σ bands</span>
+      <div className="mt-1 text-[10px] text-muted">
+        <span className="text-accent">━ price</span> · <span className="text-cyan-400">━ fast EMA</span> · <span className="text-fuchsia-400">━ slow EMA</span> · <span className="text-amber-500">━ mean (VWAP-ish)</span> · <span className="text-muted">┈ ±2σ</span>
       </div>
     </div>
   );

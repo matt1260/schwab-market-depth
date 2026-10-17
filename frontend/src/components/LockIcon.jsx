@@ -5,8 +5,8 @@ export const LockIcon = () => {
   const [mode, setMode] = useState(0);          // 0 = ±10%, 1 = manual scale
   const handleClick = () => setMode((m) => (m + 1) % 2);
   const color =
-    mode === 1 ? 'text-yellow-400'
-    : 'text-text-secondary';
+    mode === 1 ? 'text-warn'
+    : 'text-muted';
 
   const num = mode === 0 ? 'Auto' : 'Mode1';       
 

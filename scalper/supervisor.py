@@ -79,17 +79,32 @@ def _parse_json(raw: str) -> Optional[Dict[str, Any]]:
 def build_prompt(symbols: List[str], tape: Dict[str, Any], deep: bool, *,
                  tunable: Dict[str, Any], safe_bands: Dict[str, Any], bool_keys: List[str],
                  dsl_signals: List[str], recent_exits: List, day_pnl: float,
-                 win_rate: Optional[float], exits_today: int, last_tune: Optional[Dict[str, Any]]) -> str:
+                 win_rate: Optional[float], exits_today: int, last_tune: Optional[Dict[str, Any]],
+                 all_mode: bool = False) -> str:
     """Faithful port of the platform supervisor prompt."""
+    all_note = (
+        "MODE: you are running as ONE of THREE strategies being A/B-compared live "
+        "(macross=full-gate EMA cross, macross_x=cross+L2 only, and YOU='ai'). YOUR "
+        "trades use your OWN EMA pair — tune ma_fast_ai/ma_slow_ai (NOT ma_fast/ma_slow, "
+        "which belong to the mechanical strategies). Your 'mode' (momentum/fade/pause) "
+        "and your EMA lengths are your levers; make them count so we can see if the AI "
+        "beats the mechanical strategies.\n"
+    ) if all_mode else ""
     base = (
+        all_note +
         f"You are the live supervisor of a fast 0DTE options scalper on {', '.join(symbols)}. "
         "You are given recent 1-minute OHLC price action. READ THE CHART LIKE A TRADER: identify "
         "support/resistance, structure (uptrend/downtrend/range/coil), and where price sits "
         "(at support, at resistance, breaking out, breaking down, mid-range).\n"
-        "Choose the entry strategy:\n"
-        "- momentum: trade WITH the move (clean break / strong trend)\n"
-        "- fade: mean-reversion, buy dips/sell pops (rejecting a level in a range)\n"
-        "- pause: stand aside (chop, mid-range, violent/event tape)\n\n"
+        "Choose the entry stance (only two — fade is DISABLED):\n"
+        "- momentum: trade WITH the move (clean break / strong trend, riding VWAP)\n"
+        "- pause: stand aside (chop, mid-range, no clean directional edge)\n"
+        "Pick momentum ONLY when there is a real one-directional trend; otherwise pause. "
+        "Do NOT return 'fade' — it is not traded.\n"
+        "ALSO decide enable_macross (bool): turn ON the mechanical 8/21 EMA-cross "
+        "strategy to run ALONGSIDE you ONLY when the tape is a CLEAN, SUSTAINED TREND "
+        "(high efficiency, one-directional, riding VWAP) — that is its edge. Turn it OFF "
+        "in chop/mid-range/low-efficiency tape (it churns and loses there). Default OFF.\n\n"
         f"Tape: {json.dumps(tape)}\n"
     )
     if not deep:
@@ -97,22 +112,41 @@ def build_prompt(symbols: List[str], tape: Dict[str, Any], deep: bool, *,
             f"Scalper today: realized_pnl=${round(day_pnl)}, "
             f"win_rate={round(win_rate,2) if win_rate is not None else 'n/a'}, exits={exits_today}.\n\n"
             "Reply ONLY compact minified JSON, max 2 support/2 resistance per symbol, assessment <= 2 "
-            "sentences: {\"mode\":\"momentum|fade|pause\",\"levels\":{\"SYM\":{\"support\":[n,n],"
+            "sentences: {\"mode\":\"momentum|pause\",\"enable_macross\":false,\"levels\":{\"SYM\":{\"support\":[n,n],"
             "\"resistance\":[n,n],\"structure\":\"..\",\"position\":\"..\"}},\"assessment\":\"..\","
             "\"reason\":\"<10 words>\"}"
         )
     from collections import Counter
-    reason_mix = dict(Counter(r for r, _ in recent_exits))
-    wins = [p for _, p in recent_exits if p > 0]
-    losses = [p for _, p in recent_exits if p <= 0]
+    # recent_exits rows are (reason, pnl) or the richer (reason, pnl, direction, with_trend)
+    def _row(r):
+        reason = r[0]; pnl = r[1]
+        direction = r[2] if len(r) > 2 else None
+        with_trend = r[3] if len(r) > 3 else None
+        return reason, pnl, direction, with_trend
+    rows = [_row(r) for r in recent_exits]
+    reason_mix = dict(Counter(reason for reason, _, _, _ in rows))
+    wins = [p for _, p, _, _ in rows if p > 0]
+    losses = [p for _, p, _, _ in rows if p <= 0]
+    # counter-trend leak detector: P&L of trades taken WITH vs AGAINST the slow-EMA trend
+    with_pnl = sum(p for _, p, _, wt in rows if wt is True)
+    against_pnl = sum(p for _, p, _, wt in rows if wt is False)
+    with_n = sum(1 for _, _, _, wt in rows if wt is True)
+    against_n = sum(1 for _, _, _, wt in rows if wt is False)
+    # direction breakdown of LOSERS (e.g. "your losers are mostly calls")
+    loser_dirs = dict(Counter(d for _, p, d, _ in rows if p <= 0 and d))
     return base + (
         f"Current tunable params: {json.dumps(tunable)}\n"
         f"Safe bands (stay inside; values outside are clamped): {json.dumps(safe_bands)}\n"
         f"Boolean toggles you may flip: {bool_keys}\n"
-        f"Recent {len(recent_exits)} exits — reason_mix={reason_mix}, "
+        f"Recent {len(rows)} exits — reason_mix={reason_mix}, "
         f"avg_win=${round(sum(wins)/len(wins),1) if wins else 0}, "
         f"avg_loss=${round(sum(losses)/len(losses),1) if losses else 0}, "
         f"win_rate={round(win_rate,2) if win_rate is not None else 'n/a'}, exits_today={exits_today}.\n"
+        f"TREND ALIGNMENT of recent trades — WITH-trend: {with_n} trades, pnl=${round(with_pnl)}; "
+        f"AGAINST-trend: {against_n} trades, pnl=${round(against_pnl)}. Losers by direction: {loser_dirs}.\n"
+        "IF your against-trend trades are net-negative (or your losers cluster in one direction while "
+        "the tape trends the other way), you are FIGHTING THE TREND — stop taking that side. Prefer "
+        "WITH-trend entries; only counter-trend at a CLEAR rejected level with a real edge thesis.\n"
         + (f"Your last tuning: {json.dumps({k: last_tune.get(k) for k in ('param_changes','reasoning') if last_tune.get(k)})}\n" if last_tune else "")
         + "ADAPT the scalper to current conditions. In param_changes include ONLY knobs to change (diff), "
         "each within its safe band. You may NOT change order size, kill switch, symbols, or budget.\n"
@@ -131,7 +165,7 @@ def build_prompt(symbols: List[str], tape: Dict[str, Any], deep: bool, *,
         "higher-TF trend ('call'=up,'put'=down,'flat'); mtf_alignment 0..1. vwap_z = signed std-devs from "
         "session VWAP. book_imbalance (-1..1, Schwab L2) confirms direction (>0 buyers, <0 sellers). "
         "Only synthesize when you have a clear edge thesis; else set strategy_spec null.\n"
-        "Reply ONLY compact minified JSON: {\"mode\":\"momentum|fade|pause\",\"param_changes\":{...},"
+        "Reply ONLY compact minified JSON: {\"mode\":\"momentum|pause\",\"enable_macross\":false,\"param_changes\":{...},"
         "\"strategy_spec\":null|{\"rules\":[{\"when\":{...},\"action\":\"fade\"}]},\"levels\":{...},"
         "\"reasoning\":\"3-5 sentences\",\"assessment\":\"..\",\"reason\":\"<10 words>\"}"
     )

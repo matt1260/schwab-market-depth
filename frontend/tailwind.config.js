@@ -9,23 +9,45 @@ export default {
   theme: {
     extend: {
       colors: {
-        'dark-primary': '#18191A', // deep charcoal
-        'dark-secondary': '#232526', // slightly lighter charcoal
-        'dark-tertiary': '#2C2F31', // for cards/inputs
-        'accent-primary': '#bb86fc',
-        'accent-secondary': '#3700b3',
-        'text-primary': '#F3F4F6', // near white
-        'text-secondary': '#B0B3B8' // muted gray
+        // ── terminal slate surfaces (deep ink-blue, not flat black) ──
+        base:   '#0B0E14',   // app background
+        panel:  '#131722',   // cards / panels
+        raised: '#1C2230',   // inputs / raised chips
+        line:   '#2A3142',   // hairline dividers/borders
+        // ── text ──
+        ink:    '#E8EDF4',   // primary
+        muted:  '#7D8799',   // secondary
+        faint:  '#4B5468',   // tertiary / captions
+        // ── data color (used ONLY for P&L, direction, state) ──
+        up:     '#3FB68B',   // green / calls / profit
+        down:   '#E5484D',   // red / puts / loss
+        warn:   '#E0A458',   // amber / kill / live / caution
+        // ── restrained interactive accent ──
+        accent: '#5B8DEF',   // active tab, focus, primary action
+        'accent-dim': '#2B3A5C',
+        // legacy aliases so existing classes keep working during migration
+        'dark-primary': '#0B0E14',
+        'dark-secondary': '#131722',
+        'dark-tertiary': '#1C2230',
+        'accent-primary': '#5B8DEF',
+        'accent-secondary': '#2B3A5C',
+        'text-primary': '#E8EDF4',
+        'text-secondary': '#7D8799',
+      },
+      fontFamily: {
+        display: ['"Space Grotesk"', 'system-ui', 'sans-serif'],
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+        mono: ['"IBM Plex Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+      },
+      borderRadius: {
+        card: '10px',
       },
       boxShadow: {
-        'neon-blue': '0 0 5px #00f3ff, 0 0 10px #00f3ff, 0 0 15px #00f3ff',
-        'neon-green': '0 0 5px #00ff66, 0 0 10px #00ff66, 0 0 15px #00ff66',
-        'glass': '0 0 15px rgba(0, 0, 0, 0.1)',
-        'glass-strong': '0 0 20px rgba(0, 0, 0, 0.2)'
+        'panel': '0 1px 0 0 rgba(255,255,255,0.02) inset, 0 8px 24px -12px rgba(0,0,0,0.6)',
       },
       backgroundImage: {
         'gradient-radial': 'radial-gradient(var(--tw-gradient-stops))',
-      }
+      },
     },
   },
   plugins: [],

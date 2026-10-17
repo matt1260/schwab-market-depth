@@ -116,14 +116,14 @@ export default function CandleChart({ apiBaseUrl, symbol, height = 340 }) {
         <Legend color={EMA21_COLOR} label="EMA 21" />
         <Legend color={EMA50_COLOR} label="EMA 50" />
         {regime && (
-          <span className={`ml-1 px-1.5 py-0.5 rounded ${regime === 'call' ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400'}`}>
+          <span className={`ml-1 px-1.5 py-0.5 rounded ${regime === 'call' ? 'bg-up/15 text-up' : 'bg-down/15 text-down'}`}>
             {regime === 'call' ? '21 > 50 (bull)' : '21 < 50 (bear)'}
           </span>
         )}
       </div>
       <div ref={el} style={{ width: '100%', height }} />
       {empty && (
-        <div className="absolute inset-0 flex items-center justify-center text-xs text-gray-500 pointer-events-none">
+        <div className="absolute inset-0 flex items-center justify-center text-xs text-faint pointer-events-none">
           Waiting for 1-min candles…
         </div>
       )}
@@ -133,7 +133,7 @@ export default function CandleChart({ apiBaseUrl, symbol, height = 340 }) {
 
 function Legend({ color, label }) {
   return (
-    <span className="inline-flex items-center gap-1 text-gray-400">
+    <span className="inline-flex items-center gap-1 text-muted">
       <span className="inline-block w-3 h-[2px] rounded" style={{ background: color }} />
       {label}
     </span>

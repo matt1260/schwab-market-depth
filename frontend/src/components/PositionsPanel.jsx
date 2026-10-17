@@ -8,7 +8,7 @@
 export function PositionsPanel({ apiBaseUrl, positions = [], onClose }) {
   if (!positions.length) {
     return (
-      <div className="glass p-3 rounded-xl text-xs text-text-secondary">
+      <div className="glass p-3 rounded-xl text-xs text-muted">
         No open positions.
       </div>
     );
@@ -34,24 +34,24 @@ export function PositionsPanel({ apiBaseUrl, positions = [], onClose }) {
           >
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 text-sm">
-                <span className={`font-bold ${isCall ? 'text-green-400' : 'text-red-400'}`}>
+                <span className={`font-bold ${isCall ? 'text-up' : 'text-down'}`}>
                   {p.direction?.toUpperCase()}
                 </span>
-                <span className="text-gray-300 font-medium">{p.underlying}</span>
-                <span className="text-gray-500 font-mono text-xs truncate">{p.occ}</span>
-                <span className="text-[10px] uppercase tracking-wide text-gray-600">{p.strategy}</span>
+                <span className="text-muted font-medium">{p.underlying}</span>
+                <span className="text-faint font-mono text-xs truncate">{p.occ}</span>
+                <span className="text-[10px] uppercase tracking-wide text-faint">{p.strategy}</span>
               </div>
-              <div className="flex items-center gap-3 mt-1 text-xs font-mono text-gray-400">
+              <div className="flex items-center gap-3 mt-1 text-xs font-mono text-muted">
                 <span>×{p.qty}</span>
                 <span>in ${p.entry_mid}</span>
                 {p.mid != null && <span>now ${p.mid}</span>}
-                {p.peak_pct != null && <span className="text-gray-500">peak {p.peak_pct > 0 ? '+' : ''}{p.peak_pct}%</span>}
-                <span className="text-gray-500">{fmtHeld(p.held_s)}</span>
-                {p.stop_pct != null && <span className="text-gray-600">stop {p.stop_pct}%</span>}
+                {p.peak_pct != null && <span className="text-faint">peak {p.peak_pct > 0 ? '+' : ''}{p.peak_pct}%</span>}
+                <span className="text-faint">{fmtHeld(p.held_s)}</span>
+                {p.stop_pct != null && <span className="text-faint">stop {p.stop_pct}%</span>}
               </div>
             </div>
             {/* live P&L */}
-            <div className={`text-right shrink-0 ${pnlUp ? 'text-green-400' : 'text-red-400'}`}>
+            <div className={`text-right shrink-0 ${pnlUp ? 'text-up' : 'text-down'}`}>
               <div className="text-lg font-bold font-mono leading-none">
                 {p.pnl_usd != null ? `${pnlUp ? '+' : ''}$${Math.abs(p.pnl_usd)}` : '—'}
               </div>
@@ -77,7 +77,7 @@ export function OptionsLadder({ ladder = {} }) {
   if (!syms.length) return null;
   return (
     <div className="glass p-3 rounded-xl">
-      <div className="text-xs text-text-secondary mb-2">Options ladder — strikes the algo is selecting (ATM ± 2)</div>
+      <div className="eyebrow mb-2">Options ladder — strikes the algo is selecting (ATM ± 2)</div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {syms.map((sym) => {
           const l = ladder[sym];
@@ -85,14 +85,14 @@ export function OptionsLadder({ ladder = {} }) {
           return (
             <div key={sym}>
               <div className="flex items-center gap-2 mb-1 text-[11px]">
-                <span className="font-bold text-blue-300">{sym}</span>
-                <span className="text-gray-500 font-mono">spot ${l.spot}</span>
-                <span className={`px-1.5 py-0.5 rounded ${isCall ? 'bg-green-500/15 text-green-400' : 'bg-red-500/15 text-red-400'}`}>
+                <span className="font-bold text-accent">{sym}</span>
+                <span className="text-faint font-mono">spot ${l.spot}</span>
+                <span className={`px-1.5 py-0.5 rounded ${isCall ? 'bg-up/15 text-up' : 'bg-down/15 text-down'}`}>
                   eyeing {l.side?.toUpperCase()}
                 </span>
               </div>
               <table className="w-full text-xs font-mono">
-                <thead className="text-gray-600">
+                <thead className="text-faint">
                   <tr className="text-left">
                     <th className="font-normal py-0.5">Strike</th>
                     <th className="font-normal">Bid</th>
@@ -103,9 +103,9 @@ export function OptionsLadder({ ladder = {} }) {
                 </thead>
                 <tbody>
                   {(l.strikes || []).map((s) => (
-                    <tr key={s.occ} className={s.atm ? (isCall ? 'text-green-300' : 'text-red-300') : 'text-gray-400'}>
+                    <tr key={s.occ} className={s.atm ? (isCall ? 'text-up' : 'text-down') : 'text-muted'}>
                       <td className="py-0.5">
-                        {s.atm && <span className="mr-1 text-[9px] text-gray-500">ATM</span>}
+                        {s.atm && <span className="mr-1 text-[9px] text-faint">ATM</span>}
                         ${s.strike}{isCall ? 'C' : 'P'}
                       </td>
                       <td>{s.bid != null ? s.bid : '—'}</td>

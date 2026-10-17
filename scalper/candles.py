@@ -105,6 +105,41 @@ class CandleSeries:
         bodies = [b.body for b in bars if b.body > 0]
         return (sum(bodies) / len(bodies)) if bodies else None
 
+    def bull_pivot(self) -> Optional[str]:
+        """Detect a Bull Pivot on the most-recently-CLOSED bar (ThinkScript port).
+        Returns 'bull_pivot', 'bull_pivot_2', or None. `[N]` in the script = N bars ago;
+        here b(N) reads that bar (b(0) = the just-closed bar). A pivot marks a bullish
+        reversal of a 5-min downtrend; its LOW becomes a support level to play calls above.
+
+          bullbar  = (close-open) >= .38  and close>close[2] and close<open[2] and open<close[1]
+          bullbar2 = (close-open) >= .38  and close>close[2] and close<open[4]
+                     and (open[2]-close[2]) > .20
+                     and low[4]>low[1] and low[5]>low[3] and low[6]>low[4]  and !bullbar
+        """
+        bars = list(self._bars)
+        if len(bars) < 7:                 # need up to [6]
+            return None
+        def b(n): return bars[-1 - n]     # b(0)=most recent closed, b(1)=one before, ...
+        c0, o0 = b(0).c, b(0).o
+        body = c0 - o0
+        bullbar = (body >= 0.38 and c0 > b(2).c and c0 < b(2).o and o0 < b(1).c)
+        if bullbar:
+            return "bull_pivot"
+        bullbar2 = (body >= 0.38
+                    and c0 > b(2).c
+                    and c0 < b(4).o
+                    and (b(2).o - b(2).c) > 0.20
+                    and b(4).l > b(1).l
+                    and b(5).l > b(3).l
+                    and b(6).l > b(4).l)
+        if bullbar2:
+            return "bull_pivot_2"
+        return None
+
+    def last_low(self) -> Optional[float]:
+        """Low of the most-recently-CLOSED bar (the support level a pivot establishes)."""
+        return self._bars[-1].l if self._bars else None
+
     def big_candle(self) -> Optional[Tuple[str, float, Candle]]:
         """If the most-recently-CLOSED bar is a big-body candle, return
         (color, body_ratio, candle). Else None. Call after a bar closes."""

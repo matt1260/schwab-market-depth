@@ -89,6 +89,7 @@ import os as _os
 _scalper = {"engine": None, "feed": None}
 _spreads = {"engine": None}
 _scanner = {"scanner": None}
+_zdte = {"scanner": None}
 SCALPER_SYMBOLS = ["SPY", "QQQ"]
 
 
@@ -144,6 +145,14 @@ async def _start_scalper():
             import traceback as _tb
             print(f"Scanner startup failed: {_sce}")
             _tb.print_exc()
+
+        # 0DTE credit-spread scanner — ranked by probability of expiring OTM (scanner-only)
+        try:
+            from scalper.zdte_scanner import ZdteScanner
+            _zdte["scanner"] = ZdteScanner(alpaca, schwab_client_getter=lambda: getattr(feed, "_client", None))
+            print("0DTE P(OTM) spread scanner ready (on-demand)")
+        except Exception as _ze:
+            print(f"0DTE scanner init failed: {_ze}")
     except Exception as e:
         import traceback
         print(f"Scalper startup failed (UI still runs): {e}")
@@ -168,6 +177,22 @@ async def scalper_toggle(body: dict):
         raise HTTPException(503, "Scalper not initialized")
     eng.set_enabled(bool(body.get("enabled")))
     return {"enabled": eng.enabled}
+
+
+@app.post("/scalper/manual")
+async def scalper_manual(body: dict):
+    """MANUAL strategy tracker: user clicks Buy Call / Buy Put → open a scalp labeled
+    'manual' on the given symbol, managed by the shared exit ladder (peak-lock/stop).
+    Body: {symbol: 'SPY'|'QQQ', direction: 'call'|'put'}."""
+    eng = _scalper["engine"]
+    if eng is None:
+        raise HTTPException(503, "Scalper not initialized")
+    sym = (body.get("symbol") or "").upper()
+    direction = body.get("direction")
+    if direction not in ("call", "put"):
+        raise HTTPException(400, "direction must be 'call' or 'put'")
+    res = await eng.manual_entry(sym, direction)
+    return res
 
 
 @app.post("/scalper/autonomous")
@@ -260,7 +285,7 @@ async def scalper_config(body: dict):
     eng = _scalper["engine"]
     if eng is None:
         raise HTTPException(503, "Scalper not initialized")
-    if "signal_mode" in body and body["signal_mode"] in ("momentum", "fade", "auto", "ai", "macross", "macross_x", "all", "apex"):
+    if "signal_mode" in body and body["signal_mode"] in ("momentum", "fade", "auto", "ai", "macross", "macross_x", "all", "apex", "bullpivot", "manual"):
         eng.signal_mode = body["signal_mode"]
         if eng.signal_mode != "ai":
             eng._ai_enable_macross = False   # clear the AI's macross-alongside flag off 'ai' mode
@@ -303,9 +328,18 @@ async def scalper_config(body: dict):
     if "open_blackout_minutes" in body:
         eng.open_blackout_minutes = max(0, min(120, int(body["open_blackout_minutes"])))
         risk["open_blackout_minutes"] = eng.open_blackout_minutes
+    # Per-rule MANUAL-trade exit toggles (operator-only — the AI supervisor must never
+    # override which exits apply to the user's discretionary trades). Each is a plain bool.
+    _MANUAL_EXIT_KEYS = ("manual_exit_failed_reversal", "manual_exit_cross_back",
+                         "manual_exit_fast_exit", "manual_exit_peak_lock",
+                         "manual_exit_profit_target", "manual_exit_stop")
+    for k in _MANUAL_EXIT_KEYS:
+        if k in body:
+            setattr(eng, k, bool(body[k]))
+            risk[k] = bool(body[k])
     skip = ("signal_mode", "ai_supervisor_seconds", "ai_tune_seconds",
             "per_trade_usd", "max_concurrent", "daily_loss_kill_usd", "budget_usd",
-            "open_blackout_minutes")
+            "open_blackout_minutes") + _MANUAL_EXIT_KEYS
     applied = eng._apply_runtime_params({k: v for k, v in body.items() if k not in skip})
     applied.update(cadence)
     applied.update(risk)
@@ -453,6 +487,36 @@ async def scanner_scan():
         raise HTTPException(503, "Scanner not initialized")
     res = await __import__("asyncio").to_thread(sc.scan_once)
     return {"scanned": len(res), "top_tradeable": [r for r in res if r.get("tradeable")][:5]}
+
+
+# ── 0DTE credit-spread scanner, ranked by probability of expiring OTM ──
+@app.get("/zdte/status")
+async def zdte_status():
+    sc = _zdte["scanner"]
+    if sc is None:
+        return {"available": False}
+    out = sc.results()
+    out["available"] = True
+    return out
+
+
+@app.post("/zdte/scan")
+async def zdte_scan():
+    """Run the 0DTE P(OTM) scan now. Returns spreads ranked by probability of profit."""
+    sc = _zdte["scanner"]
+    if sc is None:
+        raise HTTPException(503, "0DTE scanner not initialized")
+    res = await __import__("asyncio").to_thread(sc.scan_once)
+    return {"scanned": len(res), "opportunities": res}
+
+
+@app.post("/zdte/config")
+async def zdte_config(body: dict):
+    """Tune the 0DTE scanner: pop_min, width, min_credit, min_credit_pct."""
+    sc = _zdte["scanner"]
+    if sc is None:
+        raise HTTPException(503, "0DTE scanner not initialized")
+    return {"applied": sc.set_params(**body)}
 
 
 @app.get("/")

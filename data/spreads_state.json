@@ -1,0 +1,1 @@
+{"enabled": true, "ivr_min": 30.0, "target_dte": 35, "dte_min": 30, "dte_max": 45, "short_delta": 0.3, "width": 5.0, "profit_take_frac": 0.5, "dte_close": 21, "stop_credit_mult": 2.0, "max_loss_per_spread_usd": 400.0, "max_concurrent": 4, "min_credit": 0.2, "entry_concession": 0.05, "use_scanner": true, "daily_entry_start_utc": null, "daily_entry_end_utc": null}

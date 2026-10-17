@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import ssl
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +52,16 @@ def _install_certifi_ws_ssl() -> None:
 _L1_FIELDS = "0,1,2,4,5,8"      # 1=bid 2=ask 4=bidSize 5=askSize
 _BOOK_FIELDS = "0,1,2,3"        # 2=bid levels, 3=ask levels; level 0=price 1=size
 _BOOK_DEPTH = 5
+# wall detection
+_WALL_MULT = 3.0                # a level is a big-size candidate if >= this x the book avg
+_WALL_NEAR_LEVELS = 5           # only consider levels within this many of the inside
+_WALL_SAMPLE_S = 1.0            # sample the book ~1x/sec (raw feed is sub-second churny)
+# ZONE aggregation: individual orders reprice every second, but big size keeps hitting
+# the same PRICE ZONE — that zone is the real soft support/resistance. Sum big-level
+# size into wide zones over a rolling window; a zone hit repeatedly = a wall zone.
+_WALL_ZONE = 0.25               # zone width ($) — cluster nearby walls into one S/R zone
+_WALL_WINDOW = 6                # rolling samples (~6s) to aggregate a zone over
+_WALL_ZONE_MIN_HITS = 3         # zone must draw a big wall in >= this many of the window samples
 
 
 def occ_to_schwab(occ: str) -> str:
@@ -68,6 +79,7 @@ class SchwabEquityFeed:
     def __init__(self, symbols: List[str]):
         self.symbols = symbols
         self._snap: Dict[str, Dict[str, Any]] = {}
+        self._wall_persist: Dict[str, Dict[str, Dict[float, int]]] = {}  # spoof-filter counters
         self._stream = None
         self._running = False
         self._client = None  # schwabdev Client for REST options quotes
@@ -169,6 +181,7 @@ class SchwabEquityFeed:
                     imb = self._imbalance(item)
                     if imb is not None:
                         s["book_imbalance"] = imb
+                    self._update_walls(sym, item)
 
     @staticmethod
     def _imbalance(item) -> Optional[float]:
@@ -180,6 +193,62 @@ class SchwabEquityFeed:
         tot = bsz + asz
         return ((bsz - asz) / tot) if tot > 0 else None
 
+    def _update_walls(self, sym, item):
+        """Detect liquidity WALLS near the inside. The raw NASDAQ_BOOK churns at
+        sub-second speed with big levels flickering at shifting prices, so we SAMPLE
+        the book ~1x/sec and require a wall (size >> book avg) to HOLD across several
+        1s samples at ~the same price BUCKET (spoof filter + penny-drift tolerance).
+        Stores s['walls'] = {'bid': [(price,size,persist)], 'ask': [...]}."""
+        now = datetime.now(timezone.utc)
+        last_t = self._wall_persist.get(sym, {}).get("_t")
+        if last_t is not None and (now - last_t).total_seconds() < _WALL_SAMPLE_S:
+            return  # throttle: at most one wall-sample per second
+        bids, asks = item.get("2") or [], item.get("3") or []
+        if not bids and not asks:
+            return
+        def levels(side):
+            out = []
+            for l in side[:_BOOK_DEPTH]:
+                try:
+                    out.append((float(l.get("0", 0) or 0), float(l.get("1", 0) or 0)))
+                except Exception:
+                    pass
+            return out
+        blv, alv = levels(bids), levels(asks)
+        all_sizes = [sz for _, sz in blv + alv if sz > 0]
+        if not all_sizes:
+            return
+        avg = sum(all_sizes) / len(all_sizes)
+        if avg <= 0:
+            return
+        zone = lambda p: round(round(p / _WALL_ZONE) * _WALL_ZONE, 2)
+        # this sample's big-wall ZONES: near the inside + size >= mult x avg
+        cand = {"bid": {}, "ask": {}}   # zone_price -> max big size seen this sample
+        for side, lv in (("bid", blv), ("ask", alv)):
+            for price, sz in lv[:_WALL_NEAR_LEVELS]:
+                if sz >= _WALL_MULT * avg:
+                    z = zone(price)
+                    cand[side][z] = max(cand[side].get(z, 0), sz)
+        # rolling window of recent samples' zones → a zone repeatedly hit = a wall zone
+        st = self._wall_persist.setdefault(sym, {"bid": deque(maxlen=_WALL_WINDOW),
+                                                 "ask": deque(maxlen=_WALL_WINDOW), "_t": None})
+        st["_t"] = now
+        walls = {"bid": [], "ask": []}
+        for side in ("bid", "ask"):
+            st[side].append(cand[side])                 # record this sample's zones
+            hits, maxsz = {}, {}
+            for sample in st[side]:
+                for z, sz in sample.items():
+                    hits[z] = hits.get(z, 0) + 1
+                    maxsz[z] = max(maxsz.get(z, 0), sz)
+            for z, h in hits.items():
+                if h >= _WALL_ZONE_MIN_HITS:
+                    walls[side].append((z, maxsz[z], h))   # (zone_price, biggest size, hits)
+            walls[side].sort(key=lambda t: -t[2])           # strongest (most hits) first
+        s = self._snap.setdefault(sym, {})
+        s["walls"] = walls
+        s["book_avg_size"] = avg
+
     # engine-facing accessors
     def latest_quote(self, sym) -> Optional[Dict[str, Any]]:
         s = self._snap.get(sym)
@@ -190,6 +259,13 @@ class SchwabEquityFeed:
     def book_imbalance(self, sym) -> Optional[float]:
         s = self._snap.get(sym)
         return s.get("book_imbalance") if s else None
+
+    def walls(self, sym) -> Optional[Dict[str, Any]]:
+        """Persisted liquidity walls near the inside:
+        {'bid': [(price,size,persist_snaps)], 'ask': [...]}. bid walls = support,
+        ask walls = resistance. Empty lists = no walls detected."""
+        s = self._snap.get(sym)
+        return s.get("walls") if s else None
 
     def quote_age_seconds(self, sym) -> Optional[float]:
         """Seconds since the last L1 update for a symbol (None if never). Used by

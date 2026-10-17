@@ -46,10 +46,10 @@ export default function PnlMeter({ position }) {
     <div className="glass rounded-lg px-3 py-2 mb-1.5">
       <div className="flex items-center justify-between mb-1.5">
         <span className="text-[11px] font-bold">
-          <span className={direction === 'call' ? 'text-green-400' : 'text-red-400'}>
+          <span className={direction === 'call' ? 'text-up' : 'text-down'}>
             {direction?.toUpperCase()}
           </span>
-          <span className="text-gray-400 ml-1.5">live P&amp;L</span>
+          <span className="text-muted ml-1.5">live P&amp;L</span>
         </span>
         <span className="text-sm font-bold font-mono" style={{ color: col }}>
           {pnl_usd != null ? `${up ? '+' : ''}$${Math.abs(pnl_usd)}` : '—'}

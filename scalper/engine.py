@@ -31,6 +31,7 @@ from . import indicators as ind
 from .alpaca_exec import AlpacaExec
 from . import supervisor as sup
 from .macross import EmaPair, EmaTriple, adaptive_trail_giveback
+from .candles import CandleSeries
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,7 @@ _TUNE_SAFE_BANDS: Dict[str, Tuple[float, float]] = {
     "apex_min_er": (0.0, 0.60),          # APEX strict efficiency floor
     "apex_max_vwap_z": (0.0, 4.0),       # APEX anti-chase: skip if extended past this σ (0=off)
     "apex_trend_bars": (2, 20),          # APEX dominant-trend slope lookback
+    "bullpivot_pullback_pct": (0.0, 0.50),  # Bull Pivot pullback band above support to enter
     "ma_fast_exit_buffer_pct": (0.0, 0.10),  # buffer past fast EMA for the fast exit
     "ma_fast_exit_min_hold_s": (0, 120),     # settle-in before fast exit can fire
     "ma_min_er": (0.0, 0.80),                # chop gate: min efficiency-ratio to enter
@@ -95,7 +97,7 @@ _TUNE_SAFE_BANDS: Dict[str, Tuple[float, float]] = {
 _TUNE_BOOL_KEYS = ("chop_guard_enabled", "velocity_gate_enabled", "ma_fast_exit_enabled",
                    "ma_book_gate_enabled", "ma_book_invert",
                    "ma_wall_gate_enabled", "ma_wall_bounce_signal", "ma_require_confirm",
-                   "ma_trend_bias_enabled", "ma_tri_require_l2",
+                   "ma_trend_bias_enabled", "ma_tri_require_l2", "bullpivot_require_l2",
                    "ma_failed_reversal_enabled", "ma_failed_reversal_needs_progress")
 _TUNE_INT_KEYS = ("time_stop_seconds", "regime_sample_seconds", "er_window",
                   "ma_fast", "ma_slow", "ma_tf_seconds", "ma_fast_exit_min_hold_s",
@@ -233,6 +235,19 @@ class ScalperEngine:
         self.ma_failed_reversal_needs_progress = True  # also require the UNDERLYING to have
                                           # moved in our favor vs entry; if it hasn't by the
                                           # deadline, the direction-change clearly didn't happen
+        # MANUAL-TRADE EXIT CONTROL: a manual entry is the USER'S discretionary read,
+        # not an algo signal — so each auto-exit rule is individually toggleable and
+        # applies to manual trades ONLY when its flag is on. Defaults: the aggressive
+        # early cuts (failed_reversal / cross_back / fast_exit) are OFF so the engine
+        # doesn't yank a manual trade in <1 min on gamma noise; the protective rules
+        # (peak-lock/trail, profit target, stops/backstop) are ON as a safety net.
+        # The user can flip any of these per-rule checkboxes in the UI.
+        self.manual_exit_failed_reversal = False  # 45s "reversal never worked" cut
+        self.manual_exit_cross_back = False       # EMA regime flipped against the position
+        self.manual_exit_fast_exit = False        # underlying broke back through the exit-EMA
+        self.manual_exit_peak_lock = True         # lock a runner's gains (peak-lock / trail / breakeven)
+        self.manual_exit_profit_target = True     # auto-bank at the profit target
+        self.manual_exit_stop = True              # underlying/catastrophe/time stops (the safety floor)
         # HIGHER-TF TREND BIAS: only trade WITH the slow-EMA-slope trend (ignore the
         # counter-trend 8/21 flickers on intra-trend bounces → ride the dominant move).
         self.ma_trend_bias_enabled = True
@@ -274,6 +289,12 @@ class ScalperEngine:
         self.apex_min_er = 0.30       # STRICT efficiency floor (stricter than the global)
         self.apex_max_vwap_z = 2.0    # skip if already this many σ extended in the trade dir
         self.apex_trend_bars = 10     # dominant-trend (slow-EMA slope) lookback for agreement
+        # BULL PIVOT (5-min pivot support strategy) — how close above support price must
+        # pull back before we enter the call (% of price; wider = enter further above).
+        self.bullpivot_pullback_pct = 0.10
+        # require L2 order-flow/wall confirmation to buy the call off support (the X edge
+        # — screens out limp bounces with no real bid, which churned/stopped out today).
+        self.bullpivot_require_l2 = True
         # FAST EXIT — "slow in, fast out": exit when price crosses back through the
         # FAST EMA (leads the 8/21 cross by a few min, captures the reversal earlier).
         self.ma_fast_exit_enabled = True
@@ -328,6 +349,10 @@ class ScalperEngine:
             _t.min_sep_pct = self.ma_tri_min_sep_pct
         from .candles import CandleSeries
         self._candles: Dict[str, CandleSeries] = {s: CandleSeries(self.ma_tf_seconds) for s in symbols}
+        # dedicated 5-MIN candle series for the Bull Pivot strategy (ThinkScript is on 5m)
+        self._candles5: Dict[str, CandleSeries] = {s: CandleSeries(300, maxbars=60) for s in symbols}
+        # Bull Pivot support levels: sym -> {"support": low, "kind": "bull_pivot"/"_2", "ts": epoch}
+        self._bull_support: Dict[str, dict] = {}
         # big-candle / W reversal overlay state (per symbol)
         self._block_puts: Dict[str, bool] = {}       # big red flush → don't sell puts
         self._block_calls: Dict[str, bool] = {}      # big green spike → don't buy calls
@@ -463,6 +488,36 @@ class ScalperEngine:
                                         x.get("close"), _ts)
                 if closes:
                     seeded_any = True
+                # ── 5-MIN candles for the Bull Pivot strategy — seed from 5-min history
+                # and establish the current support level (scan for the LATEST pivot).
+                cs5 = self._candles5.get(sym)
+                if cs5 is not None:
+                    try:
+                        r5 = client.price_history(sym, frequencyType="minute", frequency="5",
+                                                  startDate=start_ms, endDate=end_ms).json()
+                        c5 = r5.get("candles", [])
+                        for x in c5[-60:]:
+                            if x.get("close"):
+                                _ts = int((x.get("datetime") or 0) / 1000)
+                                cs5.seed_bar(x.get("open"), x.get("high"), x.get("low"),
+                                             x.get("close"), _ts)
+                        # replay the seeded 5-min bars to find the MOST RECENT pivot's
+                        # support (walk a rolling window; each pivot resets support).
+                        bars5 = list(cs5._bars)
+                        tmp = CandleSeries(300, maxbars=60)
+                        for cb in bars5:
+                            tmp._bars.append(cb)
+                            k = tmp.bull_pivot()
+                            if k and tmp.last_low():
+                                self._bull_support[sym] = {
+                                    "support": float(tmp.last_low()), "kind": k,
+                                    "ts": cb.ts}
+                        if sym in self._bull_support:
+                            logger.info("Bull Pivot seeded %s support @ %.2f (%s)",
+                                        sym, self._bull_support[sym]["support"],
+                                        self._bull_support[sym]["kind"])
+                    except Exception as e:
+                        logger.debug("5m seed %s failed: %s", sym, e)
             except Exception as e:
                 logger.debug("seed %s failed: %s", sym, e)
         return seeded_any
@@ -498,18 +553,14 @@ class ScalperEngine:
             entry = float(p.get("avg_entry_price") or 0)
             if entry <= 0:
                 continue
-            # rehydrated legs are labeled 'macross3' so they're managed by the CURRENT
-            # mechanical exit ladder (EMA-50 stop / 9×21 cross) — never the retired
-            # 'macross' (MA-old) strategy, which is fully decommissioned.
-            sc = _OpenScalp(occ, root, p.get("type") or "call", int(qty), entry, None, strategy="macross3")
+            # rehydrated legs are labeled 'rehydrated' — we CANNOT know which strategy
+            # actually opened a broker position after a restart, so attributing them to
+            # any real strategy corrupts the A/B stats (it was mislabeling Bull Pivot
+            # positions as the retired 9/21/50). The neutral label keeps them out of the
+            # comparison; they're still managed by the exit ladder (peak-lock/stop).
+            sc = _OpenScalp(occ, root, p.get("type") or "call", int(qty), entry, None, strategy="rehydrated")
             self._open[sc.key] = sc
             recovered += 1
-            # mark this symbol's current 21×50 leg as already-traded so the post-restart
-            # re-seed doesn't open a SECOND macross3 position on top of the rehydrated
-            # one (that stacking is what accumulated duplicate SPY/QQQ calls).
-            tri = self._ema_tri.get(root)
-            if tri is not None:
-                tri.leg_traded()
         if recovered:
             logger.info("Scalper rehydrated %d open scalp(s) from broker", recovered)
 
@@ -583,6 +634,7 @@ class ScalperEngine:
                    "ma_trail_activate_pct", "ma_peak_lock_arm_pct", "ma_peak_giveback_frac",
                    "ma_max_vwap_z", "ma_min_separation_pct", "ma_tri_min_sep_pct", "ma_tri_require_l2",
                    "chop_shutoff_er", "apex_min_er", "apex_max_vwap_z", "apex_trend_bars",
+                   "bullpivot_pullback_pct", "bullpivot_require_l2",
                    "ma_fast_exit_enabled", "ma_fast_exit_buffer_pct", "ma_fast_exit_min_hold_s",
                    "ma_min_er", "ma_breakeven_arm_pct", "ma_breakeven_floor_pct",
                    "ma_book_gate_enabled", "ma_book_invert", "ma_book_oppose",
@@ -592,7 +644,11 @@ class ScalperEngine:
                    "ma_underlying_stop_pct", "ma_stop_pct_backstop", "ma_time_stop_backstop_s",
                    "ma_min_hold_before_crossback_s", "ma_trend_bias_enabled", "ma_trend_bias_bars",
                    "ma_failed_reversal_enabled", "ma_failed_reversal_grace_s",
-                   "ma_failed_reversal_min_pnl_pct", "ma_failed_reversal_needs_progress")
+                   "ma_failed_reversal_min_pnl_pct", "ma_failed_reversal_needs_progress",
+                   # per-rule MANUAL-trade exit toggles (operator-only; not AI-tunable)
+                   "manual_exit_failed_reversal", "manual_exit_cross_back",
+                   "manual_exit_fast_exit", "manual_exit_peak_lock",
+                   "manual_exit_profit_target", "manual_exit_stop")
 
     def _state_path(self):
         return os.path.join(os.path.dirname(DB_PATH), "scalper_state.json")
@@ -694,6 +750,25 @@ class ScalperEngine:
                     closed = self._candles[sym].update(px, now)
                     if closed is not None:
                         self._on_candle_close(sym)
+                if sym in self._candles5:
+                    closed5 = self._candles5[sym].update(px, now)
+                    if closed5 is not None:
+                        self._on_5m_close(sym)
+
+    def _on_5m_close(self, sym):
+        """On each 5-min bar close, check for a Bull Pivot / Pivot 2. A pivot RESETS the
+        support level to that bar's low — calls are played above it (hard stop below)
+        until the NEXT pivot moves it."""
+        cs5 = self._candles5.get(sym)
+        if cs5 is None:
+            return
+        kind = cs5.bull_pivot()
+        if kind:
+            low = cs5.last_low()
+            if low:
+                self._bull_support[sym] = {"support": float(low), "kind": kind,
+                                           "ts": int(datetime.utcnow().timestamp())}
+                logger.info("BULL PIVOT (%s) %s — new support @ %.2f", kind, sym, low)
 
     def _on_candle_close(self, sym):
         """Big-candle + W reversal OVERLAY (macross only) — price-action that LEADS the
@@ -1061,11 +1136,14 @@ class ScalperEngine:
         if self.signal_mode == "macross_x":
             return ["macross_x"]
         if self.signal_mode == "all":
-            # 9/21/50 (macross3) REMOVED — worst performer. 'all' now runs: apex (the
-            # synthesis strategy — every winning filter stacked), X (cross+L2), and ai.
-            return ["apex", "macross_x"] + (["ai"] if self._anthropic_key else [])
+            # 9/21/50 (macross3) REMOVED — worst performer. AI strategy REMOVED too.
+            # 'all' now runs the mechanical survivors: apex (the synthesis strategy),
+            # X (cross+L2), and bullpivot (5-min pivot support).
+            return ["apex", "macross_x", "bullpivot"]
         if self.signal_mode == "apex":
             return ["apex"]
+        if self.signal_mode == "bullpivot":
+            return ["bullpivot"]
         return []   # legacy momentum/fade/auto/ai modes use the old single-position path
 
     def _l2_confirms(self, sym, direction) -> bool:
@@ -1082,7 +1160,37 @@ class ScalperEngine:
         wall_ok = ("support" in wc) if direction == "call" else ("resistance" in wc)
         return bool(book_ok or wall_ok)
 
-    def _apex_signal(self, sym) -> Tuple[Optional[str], float]:
+    def _bullpivot_signal(self, sym) -> Tuple[Optional[str], float]:
+        """BULL PIVOT strategy — CALLS ONLY, traded against 5-min pivot support levels.
+
+        A Bull Pivot / Pivot 2 (5-min) establishes a SUPPORT level (the pivot bar's low).
+        We buy CALLS above that support on a PULLBACK toward it (better price, tight stop
+        just below support), and hold until price breaks the support (hard stop — handled
+        in the exit ladder) or the NEXT pivot resets the level. Never takes puts.
+        """
+        sup = self._bull_support.get(sym)
+        px = self._latest_price(sym)
+        if not sup or not px:
+            return None, 0.0
+        support = sup["support"]
+        if px <= support:
+            return None, 0.0                 # below support → no long (stop territory)
+        # PULLBACK entry: only enter when price has dipped back NEAR support (within a
+        # band above it), so we buy the bounce off support, not an extended move.
+        band = support * (self.bullpivot_pullback_pct / 100.0)
+        if px > support + band:
+            return None, 0.0                 # too far above support — wait for a pullback
+        # L2 CONFIRMATION — require an actual SUPPORT WALL (resting bid liquidity below),
+        # NOT just a book-imbalance tilt. Bull Pivot plays a support LEVEL, so the
+        # confirmation that matters is real liquidity defending it; a transient book tilt
+        # is noise (book-only entries with no wall consistently lost / stopped out, while
+        # wall-backed entries won). So: no support wall → no entry.
+        if self.bullpivot_require_l2:
+            wc = self._wall_context(sym)
+            if "support" not in wc:
+                return None, 0.0
+        return "call", 1.0
+
         """APEX — the synthesis strategy: every filter that WON across ~2 weeks of live
         A/B, stacked for maximum selectivity (few trades, high win rate).
 
@@ -1621,6 +1729,29 @@ class ScalperEngine:
             eff_time = self.time_stop_seconds * (ind.TREND_TIME_MULT if trending else 1.0)
             reason = None
             pnl_pct = 0.0
+            # ── BULL PIVOT exit (calls only, traded against 5-min pivot support):
+            #   HARD STOP: underlying falls BELOW the pivot support level → thesis dead.
+            #   PEAK-LOCK: lock a run-up before it gives back (shared logic).
+            #   BACKSTOP : option-% catastrophe floor.
+            if scalp.strategy == "bullpivot" and mid and scalp.entry_mid > 0:
+                mid_f = float(mid)
+                pnl_pct = (mid_f - scalp.entry_mid) / scalp.entry_mid
+                if mid_f > scalp.peak_mid:
+                    scalp.peak_mid = mid_f
+                peak_pct = (scalp.peak_mid - scalp.entry_mid) / scalp.entry_mid
+                u_px = self._latest_price(scalp.underlying)
+                sup = self._bull_support.get(scalp.underlying)
+                support = sup["support"] if sup else scalp.entry_underlying
+                if u_px and support and u_px < support:
+                    reason = "stop"              # broke the pivot support → hard stop
+                elif (peak_pct >= self.ma_peak_lock_arm_pct
+                      and pnl_pct <= peak_pct * (1 - self.ma_peak_giveback_frac)):
+                    reason = "peak_lock"
+                elif pnl_pct <= -self.ma_stop_pct_backstop:
+                    reason = "stop"              # option-% catastrophe backstop
+                if reason:
+                    await self._close_scalp(scalp, mid_f, pnl_pct, reason)
+                continue
             # ── MACROSS (9/21/50 triple) exit:
             #   PRIMARY : the opposite 9×21 cross (the trend's fast/mid flip).
             #   STOP    : price closes back through EMA 50 against the position — the
@@ -1675,7 +1806,7 @@ class ScalperEngine:
                 if reason:
                     await self._do_exit(scalp, mid_f, pnl_pct, reason)
                 continue
-            if scalp.strategy in ("macross_x", "ai", "apex") and mid and scalp.entry_mid > 0:
+            if scalp.strategy in ("macross_x", "ai", "apex", "rehydrated", "manual") and mid and scalp.entry_mid > 0:
                 # High-frequency MA exit: TIGHT target, but let runners ride a trail
                 # that TIGHTENS as the move stretches from VWAP (adaptive give-back),
                 # and HARD-EXIT the instant the EMAs cross back against the position.
@@ -1685,6 +1816,12 @@ class ScalperEngine:
                     scalp.peak_mid = mid_f
                 peak_pct = (scalp.peak_mid - scalp.entry_mid) / scalp.entry_mid
                 armed = peak_pct >= self.ma_trail_activate_pct  # became a runner
+                # MANUAL trades are the operator's read: each exit rule below applies to
+                # them only if its per-rule toggle is on. _mx(flag) = "does this rule fire
+                # for this trade?" — always True for the algos, gated by `flag` for manual.
+                is_manual = scalp.strategy == "manual"
+                def _mx(flag):
+                    return (not is_manual) or bool(flag)
                 # the AI strategy rides its OWN EMA pair for cross-back/fast-exit
                 ema = (self._ema_ai if scalp.strategy == "ai" else self._ema).get(scalp.underlying)
                 regime = ema.spread_dir() if ema else None
@@ -1718,7 +1855,8 @@ class ScalperEngine:
                 # scalps (the "it should have ridden it 15 min" problem).
                 exit_ema = slow_ema if (armed and slow_ema) else fast_ema
                 fast_exit = False
-                if (self.ma_fast_exit_enabled and exit_ema and u_px and held >= self.ma_fast_exit_min_hold_s):
+                if (self.ma_fast_exit_enabled and _mx(self.manual_exit_fast_exit)
+                        and exit_ema and u_px and held >= self.ma_fast_exit_min_hold_s):
                     buf = self.ma_fast_exit_buffer_pct / 100.0 * exit_ema
                     if scalp.direction == "call" and u_px < exit_ema - buf:
                         fast_exit = True
@@ -1759,17 +1897,19 @@ class ScalperEngine:
                 # signal predicted didn't happen → cut it small. Only for trades that never
                 # became runners (an armed runner is working by definition).
                 failed_reversal = False
-                if (self.ma_failed_reversal_enabled and not armed
+                if (self.ma_failed_reversal_enabled and _mx(self.manual_exit_failed_reversal)
+                        and not armed
                         and held >= self.ma_failed_reversal_grace_s
                         and pnl_pct <= self.ma_failed_reversal_min_pnl_pct):
                     if (not self.ma_failed_reversal_needs_progress) or underlying_progress <= 0:
                         failed_reversal = True
-                if hard_stop_hit:
+                if hard_stop_hit and _mx(self.manual_exit_stop):
                     reason = "reversal_stop"         # broke the reversal candle → thesis dead
                 elif failed_reversal:
                     reason = "failed_reversal"       # never started working in the grace window
                 elif (regime is not None and regime != scalp.direction
-                      and held >= self.ma_min_hold_before_crossback_s):
+                      and held >= self.ma_min_hold_before_crossback_s
+                      and _mx(self.manual_exit_cross_back)):
                     # MIN-HOLD before cross_back: a regime flip within a few seconds of
                     # entry is the EMAs FLICKERING at the crossover (fast≈slow), not a real
                     # reversal — it was exiting fresh trades in 4s. Give the position a
@@ -1777,20 +1917,20 @@ class ScalperEngine:
                     reason = "cross_back"            # EMAs flipped (past the settle window)
                 elif fast_exit:
                     reason = "fast_exit"             # broke the exit-EMA (slow-EMA for runners)
-                elif armed and peak_pct >= self.ma_peak_lock_arm_pct and pnl_pct <= peak_pct * (1 - self.ma_peak_giveback_frac):
+                elif armed and peak_pct >= self.ma_peak_lock_arm_pct and pnl_pct <= peak_pct * (1 - self.ma_peak_giveback_frac) and _mx(self.manual_exit_peak_lock):
                     # PEAK-GIVEBACK LOCK (V-reversal fix): once a runner has a real peak,
                     # exit if it gives back this FRACTION of the peak — regardless of what
                     # the lagging EMA regime says. On a sharp V-reversal price rips back
                     # through entry before the 9×21 cross confirms, giving back most of the
                     # gain; this locks the bulk of the run instead of waiting for the cross.
                     reason = "peak_lock"
-                elif armed and not regime_agrees and pnl_pct <= peak_pct - give:
+                elif armed and not regime_agrees and pnl_pct <= peak_pct - give and _mx(self.manual_exit_peak_lock):
                     reason = "trail"                 # runner gave back margin AND trend no longer clean
-                elif not armed and pnl_pct >= self.ma_profit_target_pct:
+                elif not armed and pnl_pct >= self.ma_profit_target_pct and _mx(self.manual_exit_profit_target):
                     reason = "profit_target"         # staller hit the min target (> stop)
-                elif not armed and u_stop_hit:
+                elif not armed and u_stop_hit and _mx(self.manual_exit_stop):
                     reason = "stop"                  # UNDERLYING moved against us → real stop
-                elif not armed and pnl_pct <= -self.ma_stop_pct_backstop:
+                elif not armed and pnl_pct <= -self.ma_stop_pct_backstop and _mx(self.manual_exit_stop):
                     reason = "stop"                  # wide option-% HARD backstop (catastrophe)
                 # BREAKEVEN-TRAIL for small GREEN trades: a modestly-green trade that
                 # hasn't armed the runner-trail should NOT be time-stopped flat — lock
@@ -1807,12 +1947,12 @@ class ScalperEngine:
                 # time_stop is retained only as a FAR backstop (ma_time_stop_backstop_s) so a
                 # truly dead, never-invalidated trade can't hold literally forever.
                 if reason is None and not armed:
-                    if peak_pct >= self.ma_breakeven_arm_pct:
+                    if peak_pct >= self.ma_breakeven_arm_pct and _mx(self.manual_exit_peak_lock):
                         # green enough to protect: hold with a breakeven floor
                         if pnl_pct <= self.ma_breakeven_floor_pct:
                             reason = "be_trail"      # gave back to breakeven → lock the small win
                         # else: keep holding — let it run
-                    elif held >= self.ma_time_stop_backstop_s:
+                    elif held >= self.ma_time_stop_backstop_s and _mx(self.manual_exit_stop):
                         reason = "time_stop"         # far backstop only (never-invalidated dead trade)
             elif mid and scalp.entry_mid > 0:
                 mid_f = float(mid)
@@ -1858,7 +1998,7 @@ class ScalperEngine:
             self._watch_put.pop(scalp.underlying, None)
         elif reason == "stop":
             self._stop_cooldown[(scalp.strategy, scalp.underlying)] = datetime.utcnow() + timedelta(seconds=60)
-        elif scalp.strategy in ("macross3", "macross_x", "ai", "apex"):
+        elif scalp.strategy in ("macross3", "macross_x", "ai", "apex", "bullpivot", "rehydrated", "manual"):
             # Light re-entry guard after a non-stop close: brief cooldown so a flat close
             # doesn't machine-gun the same exhausted move — but SHORT (5s) so a whipsaw
             # that immediately crosses back and RESUMES the move can be re-entered (the
@@ -1893,7 +2033,9 @@ class ScalperEngine:
             # of direction). Block ALL strategies on a symbol whose efficiency ratio is
             # below the floor (dead/chop tape). e.g. a -$690 day was mostly SPY at ER
             # 0.02 — this gate would have skipped it entirely.
-            if self.chop_shutoff_er > 0:
+            # EXEMPT bullpivot: it's a REVERSAL play off a support level and fires right
+            # AFTER a downtrend (low ER by nature) — the chop gate would defeat it.
+            if self.chop_shutoff_er > 0 and strat != "bullpivot":
                 er = self._efficiency_ratio(sym)
                 if er is not None and er < self.chop_shutoff_er:
                     continue
@@ -1903,6 +2045,8 @@ class ScalperEngine:
                 continue
             if strat == "apex":
                 d, strn = self._apex_signal(sym)
+            elif strat == "bullpivot":
+                d, strn = self._bullpivot_signal(sym)
             elif strat == "macross3":
                 d, strn = self._macross_triple_signal(sym)
             elif strat == "macross_x":
@@ -1941,6 +2085,11 @@ class ScalperEngine:
         return self._market_open_utc_min() + 6 * 60 + 30      # 6h30m after the open
 
     async def _scan_for_entries(self):
+        # MANUAL-ONLY mode: no strategy takes any automatic entry. Only the user's
+        # Buy Call / Buy Put clicks (manual_entry, which bypasses this scan) open trades.
+        # Open positions are still managed/exited by _manage_open_scalps as normal.
+        if self.signal_mode == "manual":
+            return
         now = datetime.utcnow()
         cm_now = now.hour * 60 + now.minute
         minutes_to_close = self._market_close_utc_min() - cm_now
@@ -2047,16 +2196,36 @@ class ScalperEngine:
             else:
                 self._pending_signal[sym] = {"dir": momentum_dir, "ts": now}
 
-    async def _open_scalp(self, sym, direction, score, strategy="macross3"):
+    async def manual_entry(self, sym, direction) -> dict:
+        """User-clicked manual trade (the 'manual' strategy tracker). Opens a scalp on
+        the current spot, labeled strategy='manual', managed by the shared exit ladder
+        (peak-lock / stop) — so it compares YOUR entries vs the algos on equal footing.
+        Always executes (the user's click IS the confirmation; bypasses the pending gate).
+        """
+        direction = "call" if str(direction).lower().startswith("c") else "put"
+        if sym not in self.symbols:
+            return {"ok": False, "error": f"unknown symbol {sym}"}
+        if any(s.underlying == sym and s.strategy == "manual" for s in self._open.values()):
+            return {"ok": False, "error": f"manual already holds {sym}"}
+        try:
+            res = await self._open_scalp(sym, direction, 1.0, strategy="manual", force=True)
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:120]}
+        if res:
+            return {"ok": True, "occ": res.get("occ"), "qty": res.get("qty"),
+                    "entry": res.get("entry"), "direction": direction, "symbol": sym}
+        return {"ok": False, "error": "entry did not fill (no contract/quote/qty)"}
+
+    async def _open_scalp(self, sym, direction, score, strategy="macross3", force=False):
         underlying_px = self._latest_price(sym)
         if not underlying_px:
-            return
+            return None
         # pass spot so the chain is CENTERED on the money (else limit=200 returns low
         # strikes only → picks a deep-ITM contract → qty rounds to 0 → no trade)
         contracts = await asyncio.to_thread(self.alpaca.find_contracts, sym, direction,
                                             self.max_dte, underlying_px)
         if not contracts:
-            return
+            return None
         # pick nearest-the-money 1-strike-OTM-ish
         contracts.sort(key=lambda c: abs(c["strike"] - underlying_px))
         contract = contracts[0]
@@ -2064,17 +2233,17 @@ class ScalperEngine:
         snap = await self._option_quote(occ)
         ask = snap.get("ask") or snap.get("mid_price")
         if not ask or ask <= 0:
-            return
+            return None
         ask = float(ask)
         qty = int(self.per_trade_usd // (ask * 100.0))
         if qty < 1:
-            return
+            return None
 
         # USER-CONFIRM GATE: when autonomous is off, park the resolved entry as a
         # pending signal (with the real strike/price/qty) for the user to confirm,
-        # instead of firing. The entry stops/sizing stay fixed by config — only
-        # the go/no-go decision is handed to the user. Autonomous → execute now.
-        if not self.autonomous:
+        # instead of firing. `force` (manual click) bypasses this — the user's click IS
+        # the confirmation. Autonomous → execute now.
+        if not self.autonomous and not force:
             self._park_pending({
                 "kind": "entry", "strategy": strategy, "symbol": sym,
                 "direction": direction, "occ": occ,
@@ -2082,19 +2251,19 @@ class ScalperEngine:
                 "score": round(score, 3) if score is not None else None,
                 "reason": "entry_signal",
             })
-            return
+            return None
 
-        await self._execute_entry(sym, direction, occ, ask, qty, score, strategy,
-                                  contract.get("strike"))
+        return await self._execute_entry(sym, direction, occ, ask, qty, score, strategy,
+                                         contract.get("strike"))
 
     async def _execute_entry(self, sym, direction, occ, ask, qty, score, strategy,
                              strike=None):
         """Place the entry order + register the open scalp. Shared by the
-        autonomous path and the user-confirm path."""
+        autonomous path and the user-confirm path. Returns the entry dict (or None)."""
         underlying_px = self._latest_price(sym)
         order = await asyncio.to_thread(self.alpaca.buy_to_open, occ, qty, ask)
         if not order:
-            return
+            return None
         entry = await asyncio.to_thread(self.alpaca.fill_price, order.get("order_id"), ask)
         scalp = _OpenScalp(occ, sym, direction, qty, float(entry), order.get("order_id"), strategy=strategy)
         scalp.entry_underlying = underlying_px   # anchor the underlying-based stop
@@ -2108,6 +2277,7 @@ class ScalperEngine:
         self._entries_today += 1
         self._last_entry_at = datetime.utcnow()
         logger.info("ENTRY [%s] %s %s x%d @ %.2f", strategy, direction, occ, qty, entry)
+        return {"occ": occ, "qty": qty, "entry": round(float(entry), 2), "strike": strike}
 
     # ── user-confirmation machinery ─────────────────────────────────────────
     def _park_pending(self, sig: dict) -> str:
@@ -2228,10 +2398,11 @@ class ScalperEngine:
 
     # ── supervisor ─────────────────────────────────────────────────────────
     async def _maybe_run_supervisor(self):
-        # macross is a PURELY MECHANICAL engine — the AI is OFF (no calls, no feed,
-        # no veto). The supervisor runs for the dedicated 'ai' mode AND for 'all' mode
-        # (where 'ai' is one of the tracked strategies and needs its mode + EMA tune).
-        if not self._anthropic_key or (self.signal_mode != "ai" and self.signal_mode != "all"):
+        # The AI trading strategy was REMOVED — 'all' now runs only the mechanical
+        # survivors (apex / X / bullpivot), so the supervisor no longer fires there.
+        # It remains wired for the legacy 'ai' signal_mode only (not reachable from the
+        # UI), so no Anthropic calls are made during normal mechanical/manual trading.
+        if not self._anthropic_key or self.signal_mode != "ai":
             return
         now = datetime.utcnow()
         # (ai mode only) fast mode-check + periodic deep param-tune.
@@ -2449,6 +2620,7 @@ class ScalperEngine:
             "ma_fast": self.ma_fast, "ma_slow": self.ma_slow, "ma_tf_seconds": self.ma_tf_seconds,
             "ma_fast_ai": self.ma_fast_ai, "ma_slow_ai": self.ma_slow_ai,
             "active_strategies": self._active_scalp_strategies(),
+            "bull_support": {s: v for s, v in self._bull_support.items()},  # 5-min pivot support levels
             "ma_profit_target_pct": self.ma_profit_target_pct,
             "ma_stop_pct": self.ma_stop_pct,
             "ma_trail_giveback_pct": self.ma_trail_giveback_pct,
@@ -2458,4 +2630,11 @@ class ScalperEngine:
             "ma_fast_exit_enabled": self.ma_fast_exit_enabled,
             "ma_fast_exit_min_hold_s": self.ma_fast_exit_min_hold_s,
             "ma_min_er": self.ma_min_er,
+            # per-rule MANUAL-trade exit toggles (for the UI checkboxes)
+            "manual_exit_failed_reversal": self.manual_exit_failed_reversal,
+            "manual_exit_cross_back": self.manual_exit_cross_back,
+            "manual_exit_fast_exit": self.manual_exit_fast_exit,
+            "manual_exit_peak_lock": self.manual_exit_peak_lock,
+            "manual_exit_profit_target": self.manual_exit_profit_target,
+            "manual_exit_stop": self.manual_exit_stop,
         }
